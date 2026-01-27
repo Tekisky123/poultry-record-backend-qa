@@ -111,143 +111,28 @@ const buildVoucherBalanceMap = async (asOnDate = null) => {
   }
 };
 
-// Calculate ledger balance from voucher map (optimized)
-const calculateLedgerBalance = (ledgerName, voucherBalanceMap) => {
+// Calculate ledger balance (using outstandingBalance)
+const calculateLedgerBalance = (ledger) => {
   try {
-    const normalizedName = ledgerName.toString().trim().toLowerCase();
-    const balance = voucherBalanceMap.get(normalizedName) || { debitTotal: 0, creditTotal: 0 };
-
     return {
-      debitTotal: balance.debitTotal,
-      creditTotal: balance.creditTotal,
-      balance: balance.debitTotal - balance.creditTotal
+      debitTotal: 0, // Not needed for simple balance sheet
+      creditTotal: 0,
+      balance: toSignedValue(ledger.outstandingBalance || 0, ledger.outstandingBalanceType || 'debit')
     };
   } catch (error) {
     console.error('Error calculating ledger balance:', error);
     return { debitTotal: 0, creditTotal: 0, balance: 0 };
   }
 };
-// Calculate customer balance
-const calculateCustomerBalance = (customerId, customerName, openingBalance, openingBalanceType, vouchers, trips, date = null) => {
-  let periodDebit = 0;
-  let periodCredit = 0;
-  let openingMovement = 0;
-  const end = date ? new Date(date) : null;
-  if (end) end.setHours(23, 59, 59, 999);
 
-  if (Array.isArray(vouchers)) {
-    vouchers.forEach(voucher => {
-      const vDate = new Date(voucher.date);
-      if (end && vDate > end) return;
-      const isBeforeStart = false; // No start date for balance sheet usually (cumulative)
-
-      let vDebit = 0;
-      let vCredit = 0;
-
-      if ((voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.parties) {
-        voucher.parties.forEach(party => {
-          if (party.partyId && party.partyId.toString() === customerId.toString() && party.partyType === 'customer') {
-            if (voucher.voucherType === 'Payment') vDebit += party.amount || 0;
-            else if (voucher.voucherType === 'Receipt') vCredit += party.amount || 0;
-          }
-        });
-      }
-      // Skipping legacy name match for performance in bulk report, can be added if critical
-
-      periodDebit += vDebit;
-      periodCredit += vCredit;
-    });
-  }
-
-  if (Array.isArray(trips)) {
-    trips.forEach(trip => {
-      const tDate = new Date(trip.createdAt);
-      if (end && tDate > end) return;
-
-      let tDebit = 0;
-      let tCredit = 0;
-
-      if (trip.sales) {
-        trip.sales.forEach(sale => {
-          if (sale.client && sale.client.toString() === customerId.toString() && !sale.isReceipt) {
-            tDebit += sale.amount || 0;
-            tCredit += (sale.cashPaid || 0) + (sale.onlinePaid || 0) + (sale.discount || 0);
-          }
-        });
-      }
-      periodDebit += tDebit;
-      periodCredit += tCredit;
-    });
-  }
-
-  const openingSigned = toSignedValue(openingBalance || 0, openingBalanceType || 'debit');
-  return openingSigned + periodDebit - periodCredit;
+// Calculate customer balance (using outstandingBalance)
+const calculateCustomerBalance = (customer) => {
+  return toSignedValue(customer.outstandingBalance || 0, customer.outstandingBalanceType || 'debit');
 };
 
-// Calculate vendor balance
-const calculateVendorBalance = (vendorId, vendorName, openingBalance, openingBalanceType, vouchers, trips, stocks, date = null) => {
-  let periodDebit = 0;
-  let periodCredit = 0;
-  const end = date ? new Date(date) : null;
-  if (end) end.setHours(23, 59, 59, 999);
-
-  if (Array.isArray(vouchers)) {
-    vouchers.forEach(voucher => {
-      const vDate = new Date(voucher.date);
-      if (end && vDate > end) return;
-
-      let vDebit = 0;
-      let vCredit = 0;
-
-      if ((voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.parties) {
-        voucher.parties.forEach(party => {
-          if (party.partyId && party.partyId.toString() === vendorId.toString() && party.partyType === 'vendor') {
-            if (voucher.voucherType === 'Payment') vDebit += party.amount || 0;
-            else if (voucher.voucherType === 'Receipt') vCredit += party.amount || 0;
-          }
-        });
-      }
-      periodDebit += vDebit;
-      periodCredit += vCredit;
-    });
-  }
-
-  if (Array.isArray(trips)) {
-    trips.forEach(trip => {
-      const tDate = new Date(trip.createdAt);
-      if (end && tDate > end) return;
-
-      let tDebit = 0;
-      let tCredit = 0;
-
-      if (trip.purchases) {
-        trip.purchases.forEach(purchase => {
-          if (purchase.supplier && purchase.supplier.toString() === vendorId.toString()) {
-            tCredit += purchase.amount || 0;
-          }
-        });
-      }
-      periodDebit += tDebit;
-      periodCredit += tCredit;
-    });
-  }
-
-  if (Array.isArray(stocks)) {
-    stocks.forEach(stock => {
-      const sDate = new Date(stock.date);
-      if (end && sDate > end) return;
-      const stockVendorId = stock.vendorId?._id || stock.vendorId;
-      if (stockVendorId && stockVendorId.toString() === vendorId.toString()) {
-        if (stock.type === 'purchase' || stock.type === 'opening') {
-          periodCredit += stock.amount || 0;
-        }
-      }
-    });
-  }
-
-  // Vendors usually have Credit opening balance
-  const openingSigned = toSignedValue(openingBalance || 0, openingBalanceType || 'credit');
-  return openingSigned + periodDebit - periodCredit;
+// Calculate vendor balance (using outstandingBalance)
+const calculateVendorBalance = (vendor) => {
+  return toSignedValue(vendor.outstandingBalance || 0, vendor.outstandingBalanceType || 'credit');
 };
 const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, vendorGroupMap, customerGroupMap, allVouchers, allTrips, allStocks, asOnDate = null) => {
   let totalBalance = 0;
@@ -262,7 +147,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
 
   // Process all ledgers
   for (const ledger of ledgers) {
-    const ledgerBalance = calculateLedgerBalance(ledger.name, voucherBalanceMap);
+    const ledgerBalance = calculateLedgerBalance(ledger);
     totalDebit += ledgerBalance.debitTotal;
     totalCredit += ledgerBalance.creditTotal;
     totalOpeningBalance += ledger.openingBalance || 0;
@@ -280,16 +165,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
   // Process vendors
   const vendors = vendorGroupMap.get(groupId.toString()) || [];
   for (const vendor of vendors) {
-    const balance = calculateVendorBalance(
-      vendor._id,
-      vendor.vendorName,
-      vendor.openingBalance,
-      vendor.openingBalanceType,
-      allVouchers,
-      allTrips,
-      allStocks,
-      asOnDate
-    );
+    const balance = calculateVendorBalance(vendor);
     // Assuming vendor balance is Debit - Credit (so usually negative for liability)
 
     // Update totals (approximate debit/credit split is hard without full breakdown return, but balance is key)
@@ -316,15 +192,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
   // Process customers
   const customers = customerGroupMap.get(groupId.toString()) || [];
   for (const customer of customers) {
-    const balance = calculateCustomerBalance(
-      customer._id,
-      customer.shopName || customer.ownerName,
-      customer.openingBalance,
-      customer.openingBalanceType,
-      allVouchers,
-      allTrips,
-      asOnDate
-    );
+    const balance = calculateCustomerBalance(customer);
 
     if (balance >= 0) {
       totalDebit += balance;
@@ -357,7 +225,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
 };
 
 // Calculate Capital/Equity (Income - Expenses) - optimized
-const calculateCapital = async (voucherBalanceMap, allLedgers, asOnDate = null) => {
+const calculateCapital = async (voucherBalanceMap, allLedgers) => {
   try {
     // Get all income and expense groups to filters ledgers
     // Better way: Filter allLedgers based on their populated Group type
@@ -380,11 +248,15 @@ const calculateCapital = async (voucherBalanceMap, allLedgers, asOnDate = null) 
       const groupId = ledger.group.toString();
 
       if (incomeGroupIds.has(groupId)) {
-        const balance = calculateLedgerBalance(ledger.name, voucherBalanceMap);
-        totalIncome += (balance.creditTotal - balance.debitTotal);
+        const balance = calculateLedgerBalance(ledger);
+        // Income is Credit (Negative in signed value). We want positive magnitude for Total Income.
+        // So we subtract the negative balance (or take abs).
+        // Safest: -balance.balance (if Credit is -100, Income is 100)
+        totalIncome -= balance.balance;
       } else if (expenseGroupIds.has(groupId)) {
-        const balance = calculateLedgerBalance(ledger.name, voucherBalanceMap);
-        totalExpenses += (balance.debitTotal - balance.creditTotal);
+        const balance = calculateLedgerBalance(ledger);
+        // Expense is Debit (Positive in signed value).
+        totalExpenses += balance.balance;
       }
     }
 
@@ -499,16 +371,13 @@ export const getBalanceSheet = async (req, res, next) => {
     const processedLiabilities = await processGroups(liabilityTree);
 
     // Calculate capital/equity (pass voucher map)
-    const capital = await calculateCapital(voucherBalanceMap, allLedgers, date);
+    const capital = await calculateCapital(voucherBalanceMap, allLedgers);
 
     // Calculate totals
     const calculateTotal = (groups) => {
       let total = 0;
       groups.forEach(group => {
         total += Math.abs(group.balance);
-        if (group.children && group.children.length > 0) {
-          total += calculateTotal(group.children);
-        }
       });
       return total;
     };

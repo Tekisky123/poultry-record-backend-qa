@@ -17,7 +17,8 @@ const inventoryStockSchema = new mongoose.Schema({
       "mortality",
       "weight_loss",
       "consume",   // feed consume
-      "receipt"
+      "receipt",
+      "natural_weight_loss"
     ],
     required: true
   },

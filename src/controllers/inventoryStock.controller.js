@@ -101,7 +101,7 @@ export const addWeightLoss = async (req, res, next) => {
     try {
         const weightLossData = {
             ...req.body,
-            type: "weight_loss",
+            type: req.body.type === "natural_weight_loss" ? "natural_weight_loss" : "weight_loss",
             inventoryType: "bird",
             supervisorId: req.user._id,
             date: req.body.date || new Date(),

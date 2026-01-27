@@ -5,6 +5,7 @@ import Vendor from "../models/Vendor.js";
 import Voucher from "../models/Voucher.js";
 import Trip from "../models/Trip.js";
 import InventoryStock from "../models/InventoryStock.js";
+import IndirectSale from "../models/IndirectSale.js";
 import { successResponse } from "../utils/responseHandler.js";
 import AppError from "../utils/AppError.js";
 import { toSignedValue, fromSignedValue } from "../utils/balanceUtils.js";
@@ -265,216 +266,135 @@ export const getGroupsByType = async (req, res, next) => {
 
 // Calculate ledger balance from vouchers up to asOnDate
 
-// Updated to accept ledgerName and calculate correctly
-const calculateLedgerBalance = async (ledgerId, ledgerName, openingBalance, openingBalanceType, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null) => {
+// Updated to accept ledgerDoc and calculate correctly using outstandingBalance
+const calculateLedgerBalance = (ledgerDoc, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedStocks = null) => {
     try {
         let periodDebit = 0;
         let periodCredit = 0;
-        let openingMovement = 0;
-
+        let voucherAmount = 0;
         const start = startDate ? new Date(startDate) : null;
         const end = endDate ? new Date(endDate) : null;
-        if (end) {
-            end.setHours(23, 59, 59, 999);
-        }
+        if (end) end.setHours(23, 59, 59, 999);
 
-        let vouchers = preFetchedVouchers;
+        const ledgerId = ledgerDoc._id;
+        const ledgerName = ledgerDoc.name;
 
-        if (!vouchers) {
-            const query = {
-                isActive: true
-            };
-            if (end) {
-                query.date = { $lte: end };
-            }
-            vouchers = await Voucher.find(query).lean();
-        }
-
-        if (Array.isArray(vouchers)) {
-            vouchers.forEach(voucher => {
-                const vDate = new Date(voucher.date);
+        // Process Vouchers (using logic from getLedgerTransactions)
+        if (Array.isArray(preFetchedVouchers)) {
+            preFetchedVouchers.forEach(v => {
+                const vDate = new Date(v.date);
                 if (end && vDate > end) return;
 
-                // Only consider posted vouchers
-                // if (voucher.status && voucher.status !== 'posted') return;
+                // For period stats, we only count within start/end
+                const isInPeriod = (!start || vDate >= start);
 
-                const isBeforeStart = start && vDate < start;
-                let vDebit = 0;
-                let vCredit = 0;
+                let debit = 0;
+                let credit = 0;
+                let isMatch = false;
 
-                const ledgerIdStr = ledgerId.toString();
-                const ledgerNameStr = ledgerName ? ledgerName.trim().toLowerCase() : '';
-
-                // 1. Check entries (Journal, Contra, or Payment/Receipt splits)
-                if (voucher.entries) {
-                    voucher.entries.forEach(entry => {
-                        let isMatch = false;
-                        if (entry.account) {
-                            const entryAcc = entry.account.toString().trim().toLowerCase();
-                            // Match by Name or ID
-                            if (entryAcc === ledgerNameStr || entryAcc === ledgerIdStr) {
+                // Determine Debit/Credit
+                if (v.voucherType === 'Payment' || v.voucherType === 'Receipt') {
+                    if (v.account && v.account.toString() === ledgerId.toString()) {
+                        // Header match
+                        const totalAmount = v.parties ? v.parties.reduce((sum, p) => sum + (p.amount || 0), 0) : 0;
+                        if (v.voucherType === 'Payment') credit += totalAmount;
+                        else debit += totalAmount;
+                        isMatch = true;
+                    }
+                    if (v.parties) {
+                        v.parties.forEach(p => {
+                            if (p.partyId && p.partyId.toString() === ledgerId.toString()) {
+                                if (v.voucherType === 'Payment') debit += p.amount || 0;
+                                else credit += p.amount || 0;
                                 isMatch = true;
                             }
-                        }
-
-                        if (isMatch) {
-                            vDebit += entry.debitAmount || 0;
-                            vCredit += entry.creditAmount || 0;
-                        }
-                    });
-                }
-
-                // 2. Check parties (Payment/Receipt line items where partyType is 'ledger')
-                if ((voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.parties) {
-                    voucher.parties.forEach(party => {
-                        if (party.partyType === 'ledger' && party.partyId && party.partyId.toString() === ledgerIdStr) {
-                            if (voucher.voucherType === 'Payment') {
-                                // Payment to ledger: Ledger gets Debited 
-                                vDebit += party.amount || 0;
-                            } else if (voucher.voucherType === 'Receipt') {
-                                // Receipt from ledger: Ledger gets Credited 
-                                vCredit += party.amount || 0;
+                        });
+                    }
+                } else {
+                    // Journal/Contra
+                    if (v.entries) {
+                        v.entries.forEach(e => {
+                            if (e.account && e.account.toString().trim().toLowerCase() === ledgerName.trim().toLowerCase()) {
+                                debit += e.debitAmount || 0;
+                                credit += e.creditAmount || 0;
+                                isMatch = true;
                             }
-                        }
-                    });
-                }
-
-                // 3. Check account (Payment/Receipt Header - e.g. Cash/Bank Ledger)
-                if ((voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.account) {
-                    if (voucher.account.toString() === ledgerIdStr) {
-                        const totalAmount = voucher.parties ? voucher.parties.reduce((sum, p) => sum + (p.amount || 0), 0) : 0;
-
-                        if (voucher.voucherType === 'Payment') {
-                            // Payment from Account: Account gets Credited 
-                            vCredit += totalAmount;
-                        } else if (voucher.voucherType === 'Receipt') {
-                            // Receipt to Account: Account gets Debited 
-                            vDebit += totalAmount;
-                        }
+                        });
                     }
                 }
 
-                if (isBeforeStart) {
-                    openingMovement += (vDebit - vCredit);
-                } else {
-                    periodDebit += vDebit;
-                    periodCredit += vCredit;
+                if (isInPeriod && isMatch) {
+                    periodDebit += debit;
+                    periodCredit += credit;
+                    // Discount logic (heuristic: Journals are often adjustments/discounts)
+                    if (v.voucherType === 'Journal' || v.voucherType === 'Contra') {
+                        voucherAmount += (debit + credit);
+                    }
                 }
             });
         }
 
-        // Get trips
-        let trips = preFetchedTrips;
-        if (!trips) {
-            // Only fetch if we suspect this ledger might be involved in trips (Cash/Bank)
-            // Or just fetch matching trips
-            const tripQuery = {
-                $or: [
-                    { 'sales.cashLedger': ledgerId },
-                    { 'sales.onlineLedger': ledgerId }
-                ]
-            };
-            if (end) {
-                // optimize: use date from trip schema if possible, but createdAt is used elsewhere
-                tripQuery.createdAt = { $lte: end };
-            }
-            // Only fetch if we really need to? For now, let's fetch.
-            // Note: Trip imports might be needed if not present (it is imported at top)
-            trips = await Trip.find(tripQuery).lean();
-        }
-
-        if (Array.isArray(trips)) {
-            trips.forEach(trip => {
-                const tDate = new Date(trip.createdAt); // Consistent with Vendor/Customer calc
+        // Process Trips
+        if (Array.isArray(preFetchedTrips)) {
+            preFetchedTrips.forEach(t => {
+                const tDate = new Date(t.createdAt);
                 if (end && tDate > end) return;
+                const isInPeriod = (!start || tDate >= start);
 
-                const isBeforeStart = start && tDate < start;
-                let tDebit = 0;
-                let tCredit = 0;
-
-                if (trip.sales) {
-                    trip.sales.forEach(sale => {
-                        // Cash Payment received -> Debit Cash Ledger
-                        if (sale.cashLedger && sale.cashLedger.toString() === ledgerId.toString()) {
-                            tDebit += (sale.cashPaid || 0);
+                if (isInPeriod && t.sales) {
+                    t.sales.forEach(s => {
+                        let localDebit = 0;
+                        if (s.cashLedger && s.cashLedger.toString() === ledgerId.toString()) {
+                            localDebit += s.cashPaid || 0;
                         }
-                        // Online Payment received -> Debit Bank Ledger
-                        if (sale.onlineLedger && sale.onlineLedger.toString() === ledgerId.toString()) {
-                            tDebit += (sale.onlinePaid || 0);
+                        if (s.onlineLedger && s.onlineLedger.toString() === ledgerId.toString()) {
+                            localDebit += s.onlinePaid || 0;
                         }
+                        if (localDebit > 0) periodDebit += localDebit;
                     });
-                }
-
-                if (isBeforeStart) {
-                    openingMovement += (tDebit - tCredit);
-                } else {
-                    periodDebit += tDebit;
-                    periodCredit += tCredit;
                 }
             });
         }
 
-        // Start with opening balance
-        const openingSigned = toSignedValue(openingBalance || 0, openingBalanceType || 'debit');
+        // Process Stocks
+        if (Array.isArray(preFetchedStocks)) {
+            preFetchedStocks.forEach(s => {
+                const sDate = new Date(s.date);
+                if (end && sDate > end) return;
+                const isInPeriod = (!start || sDate >= start);
 
-        // Total flow
-        const calculatedOpening = openingSigned + openingMovement;
-        const finalSigned = calculatedOpening + periodDebit - periodCredit;
-
-        // Calculate Discount & Other for Ledger
-        let discountAndOther = 0;
-        if (Array.isArray(vouchers)) {
-            vouchers.forEach(voucher => {
-                const vDate = new Date(voucher.date);
-                if (end && vDate > end) return;
-
-                let isMatch = false;
-                let amount = 0;
-
-                // Match Logic (simplified from main loop)
-                const ledgerIdStr = ledgerId.toString();
-                const ledgerNameStr = ledgerName ? ledgerName.trim().toLowerCase() : '';
-
-                if (voucher.entries) {
-                    voucher.entries.forEach(entry => {
-                        const entryAcc = entry.account ? entry.account.toString().trim().toLowerCase() : '';
-                        if (entryAcc === ledgerNameStr || entryAcc === ledgerIdStr) {
-                            isMatch = true;
-                            amount += (entry.debitAmount || 0) + (entry.creditAmount || 0);
-                        }
-                    });
-                }
-                if (!isMatch && (voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.parties) {
-                    voucher.parties.forEach(party => {
-                        if (party.partyType === 'ledger' && party.partyId && party.partyId.toString() === ledgerIdStr) {
-                            isMatch = true;
-                            amount += party.amount || 0;
-                        }
-                    });
-                }
-                if (!isMatch && (voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.account) {
-                    if (voucher.account.toString() === ledgerIdStr) {
-                        const totalAmount = voucher.parties ? voucher.parties.reduce((sum, p) => sum + (p.amount || 0), 0) : 0;
-                        isMatch = true;
-                        amount += totalAmount;
+                if (isInPeriod) {
+                    let debit = 0;
+                    // Cash Payment
+                    if (s.cashLedgerId && s.cashLedgerId.toString() === ledgerId.toString()) {
+                        debit += s.cashPaid || 0;
                     }
-                }
-
-                if (isMatch) {
-                    // Logic: Journal included
-                    if (voucher.voucherType !== 'Receipt' && voucher.voucherType !== 'Payment') {
-                        discountAndOther += amount;
+                    // Online Payment
+                    if (s.onlineLedgerId && s.onlineLedgerId.toString() === ledgerId.toString()) {
+                        debit += s.onlinePaid || 0;
                     }
+                    // Expense 
+                    if (s.expenseLedgerId && s.expenseLedgerId.toString() === ledgerId.toString()) {
+                        debit += s.amount || 0;
+                    }
+                    periodDebit += debit;
                 }
             });
         }
+
+        // Final Balance is trusted from DB
+        const finalSigned = toSignedValue(ledgerDoc.outstandingBalance || 0, ledgerDoc.outstandingBalanceType || 'debit');
+
+        // Calculated Opening = Closing - (Debit - Credit)
+        // This opening balance is derived to make the math work for the period report
+        const calculatedOpening = finalSigned - (periodDebit - periodCredit);
 
         return {
             debitTotal: periodDebit,
             creditTotal: periodCredit,
             finalBalance: finalSigned,
             openingBalance: calculatedOpening,
-            discountAndOther
+            discountAndOther: voucherAmount
         };
     } catch (error) {
         console.error('Error calculating ledger balance:', error);
@@ -482,182 +402,142 @@ const calculateLedgerBalance = async (ledgerId, ledgerName, openingBalance, open
     }
 };
 
+
+
+
 // Calculate customer balance from vouchers and sales up to asOnDate
-const calculateCustomerBalance = async (customerId, customerName, openingBalance, openingBalanceType, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null) => {
+// Calculate customer balance (using logic from getCustomerPurchaseLedger)
+const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedIndirectSales = null, preFetchedStocks = null) => {
     try {
-        let periodDebit = 0;
-        let periodCredit = 0;
+        let periodDebit = 0; // Sales count as Debit (Receivable)
+        let periodCredit = 0; // Receipts count as Credit
         let birdsTotal = 0;
         let weightTotal = 0;
-        let openingMovement = 0;
+        let discountAndOther = 0;
 
         const start = startDate ? new Date(startDate) : null;
         const end = endDate ? new Date(endDate) : null;
+        if (end) end.setHours(23, 59, 59, 999);
 
-        // Get vouchers
-        let vouchers = preFetchedVouchers;
-        if (!vouchers) {
-            const voucherQuery = {
-                isActive: true,
-                // status: 'posted'
-            };
-            if (end) {
-                voucherQuery.date = { $lte: end };
-            }
-            vouchers = await Voucher.find(voucherQuery).lean();
-        }
+        const customerId = customerDoc._id;
+        const customerName = customerDoc.shopName || customerDoc.ownerName || '';
 
-        // Process vouchers
-        vouchers.forEach(voucher => {
-            const vDate = new Date(voucher.date);
-            if (end && vDate > end) return;
-            // if (voucher.status !== 'posted') return;
-
-            const isBeforeStart = start && vDate < start;
-            let vDebit = 0;
-            let vCredit = 0;
-
-            // Check Payment/Receipt vouchers with parties array
-            if ((voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.parties) {
-                voucher.parties.forEach(party => {
-                    if (party.partyId && party.partyId.toString() === customerId.toString() && party.partyType === 'customer') {
-                        if (voucher.voucherType === 'Payment') {
-                            vDebit += party.amount || 0;
-                        } else if (voucher.voucherType === 'Receipt') {
-                            vCredit += party.amount || 0;
-                        }
-                    }
-                });
-            }
-
-            // Check entries array for customer name match (backup legacy check)
-            voucher.entries.forEach(entry => {
-                if (entry.account && entry.account.trim().toLowerCase() === customerName.trim().toLowerCase()) {
-                    vDebit += entry.debitAmount || 0;
-                    vCredit += entry.creditAmount || 0;
-                }
-            });
-
-            if (isBeforeStart) {
-                openingMovement += (vDebit - vCredit);
-            } else {
-                periodDebit += vDebit;
-                periodCredit += vCredit;
-            }
-        });
-
-        // Get trips
-        let trips = preFetchedTrips;
-        if (!trips) {
-            const tripQuery = {
-                'sales.client': customerId,
-                'sales.isReceipt': { $ne: true }
-            };
-            if (end) {
-                tripQuery.createdAt = { $lte: end };
-            }
-            trips = await Trip.find(tripQuery).lean();
-        }
-
-        trips.forEach(trip => {
-            const tDate = new Date(trip.createdAt);
-            if (end && tDate > end) return;
-
-            const isBeforeStart = start && tDate < start;
-
-            let tDebit = 0;
-            let tCredit = 0;
-
-            trip.sales.forEach(sale => {
-                if (sale.client && sale.client.toString() === customerId.toString() && !sale.isReceipt) {
-                    // Sales increase customer balance (debit to customer)
-                    tDebit += sale.amount || 0;
-                    // Payments decrease customer balance (credit to customer)
-                    tCredit += (sale.cashPaid || 0) + (sale.onlinePaid || 0) + (sale.discount || 0);
-
-                    if (!isBeforeStart) {
-                        // Add birds and weight only for period
-                        birdsTotal += sale.birds || 0;
-                        weightTotal += sale.weight || 0;
-                    }
-                }
-            });
-
-            if (isBeforeStart) {
-                openingMovement += (tDebit - tCredit);
-            } else {
-                periodDebit += tDebit;
-                periodCredit += tCredit;
-            }
-        });
-
-        // Start with opening balance
-        const openingSigned = toSignedValue(openingBalance || 0, openingBalanceType || 'debit');
-        const calculatedOpening = openingSigned + openingMovement;
-        const finalSigned = calculatedOpening + periodDebit - periodCredit;
-
-        // Calculate Discount & Other (Matching customer.controller.js logic)
-        let discountAndOther = 0;
-
-        // 1. From Vouchers
-        if (Array.isArray(vouchers)) {
-            vouchers.forEach(voucher => {
-                const vDate = new Date(voucher.date);
+        // 1. Process Vouchers
+        if (Array.isArray(preFetchedVouchers)) {
+            preFetchedVouchers.forEach(v => {
+                const vDate = new Date(v.date);
                 if (end && vDate > end) return;
-                // if (voucher.status !== 'posted') return; // consistency with main loop
+                const isInPeriod = (!start || vDate >= start);
 
-                let isMatch = false;
-                let amount = 0;
+                if (isInPeriod) {
+                    let amount = 0;
+                    let isMatch = false;
+                    let type = '';
 
-                // Check parties
-                if (voucher.parties) {
-                    voucher.parties.forEach(party => {
-                        if (party.partyId && party.partyId.toString() === customerId.toString() && party.partyType === 'customer') {
+                    if (v.voucherType === 'Payment') {
+                        const partyData = v.parties?.find(p => p.partyId && p.partyId.toString() === customerId.toString());
+                        if (partyData) {
+                            amount = partyData.amount || 0;
+                            type = 'Payment'; // Treated as RECEIPT in Admin logic? No, wait.
+                            // getCustomerPurchaseLedger: Payment Voucher -> Particulars = "RECEIPT" (Customer balance INCREASES? Line 1063: Balance + Amount)
+                            // This is unusual. Usually Payment to Customer = Debit (Receivable increases or Liability decreases).
+                            // We owe them money/refund? Or we gave them money?
+                            // If we gave them money (Payment), they owe us more (Debit). 
+                            // So Payment -> Debit.
+                            periodDebit += amount;
                             isMatch = true;
-                            amount += party.amount || 0;
                         }
-                    });
-                }
-
-                // Check entries (backup)
-                if (!isMatch && voucher.entries) {
-                    voucher.entries.forEach(entry => {
-                        if (entry.account && entry.account.trim().toLowerCase() === customerName.trim().toLowerCase()) {
+                    } else if (v.voucherType === 'Receipt') {
+                        // Receipt from Customer -> Credit (Decreases Receivable).
+                        const partyData = v.parties?.find(p => p.partyId && p.partyId.toString() === customerId.toString());
+                        if (partyData) {
+                            amount = partyData.amount || 0;
+                            periodCredit += amount;
                             isMatch = true;
-                            // Add max(debit, credit) as amount
-                            amount += (entry.debitAmount || 0) + (entry.creditAmount || 0);
                         }
-                    });
-                }
+                    } else {
+                        // Journal
+                        const entry = v.entries?.find(e => e.account === customerName);
+                        if (entry) {
+                            amount = entry.debitAmount || entry.creditAmount;
+                            if (entry.debitAmount > 0) periodDebit += amount;
+                            else periodCredit += amount;
 
-                if (isMatch) {
-                    // Logic: 
-                    // Payment Voucher -> 'RECEIPT' (Excluded)
-                    // Receipt Voucher -> 'PAYMENT' (Included) - Customer pays us
-                    // Journal Voucher -> 'JOURNAL' (Included)
-
-                    if (voucher.voucherType !== 'Receipt' && voucher.voucherType !== 'Payment') {
-                        discountAndOther += amount;
+                            // Add to Discount/Other if Journal
+                            discountAndOther += amount;
+                            isMatch = true;
+                        }
                     }
                 }
             });
         }
 
-        // 2. From Trips (Sales)
-        if (Array.isArray(trips)) {
-            trips.forEach(trip => {
+        // 2. Process Trips (Direct Sales)
+        if (Array.isArray(preFetchedTrips)) {
+            preFetchedTrips.forEach(trip => {
                 const tDate = new Date(trip.createdAt);
                 if (end && tDate > end) return;
+                const isInPeriod = (!start || tDate >= start);
 
-                if (trip.sales) {
+                if (isInPeriod && trip.sales) {
                     trip.sales.forEach(sale => {
                         if (sale.client && sale.client.toString() === customerId.toString()) {
+                            // Sale Amount -> Debit
+                            periodDebit += sale.amount || 0;
+                            // Payments (Cash/Online) -> Credit
+                            periodCredit += (sale.cashPaid || 0) + (sale.onlinePaid || 0) + (sale.discount || 0);
+
+                            birdsTotal += (sale.birds || sale.birdsCount || 0);
+                            weightTotal += sale.weight || 0;
                             discountAndOther += sale.discount || 0;
                         }
                     });
                 }
             });
         }
+
+        // 3. Process Indirect Sales
+        if (Array.isArray(preFetchedIndirectSales)) {
+            preFetchedIndirectSales.forEach(sale => {
+                const sDate = new Date(sale.date);
+                if (end && sDate > end) return;
+                const isInPeriod = (!start || sDate >= start);
+
+                if (isInPeriod && sale.customer && sale.customer.toString() === customerId.toString()) {
+                    const salesInfo = sale.sales || {};
+                    // Indirect Sale -> Debit
+                    periodDebit += salesInfo.amount || 0;
+
+                    birdsTotal += salesInfo.birds || 0;
+                    weightTotal += salesInfo.weight || 0;
+                }
+            });
+        }
+
+        // 4. Process Stocks (Direct Sales via Manage Stocks)
+        if (Array.isArray(preFetchedStocks)) {
+            preFetchedStocks.forEach(stock => {
+                const sDate = new Date(stock.date);
+                if (end && sDate > end) return;
+                const isInPeriod = (!start || sDate >= start);
+
+                if (isInPeriod && stock.customerId && stock.customerId.toString() === customerId.toString()) {
+                    if (stock.type === 'sale' || stock.type === 'receipt') {
+                        if (stock.type === 'sale') {
+                            periodDebit += stock.amount || 0;
+                            birdsTotal += stock.birds || 0;
+                            weightTotal += stock.weight || 0;
+                        }
+                        // Payments within stock
+                        periodCredit += (stock.cashPaid || 0) + (stock.onlinePaid || 0) + (stock.discount || 0);
+                        discountAndOther += stock.discount || 0;
+                    }
+                }
+            });
+        }
+
+        const finalSigned = toSignedValue(customerDoc.outstandingBalance || 0, customerDoc.outstandingBalanceType || 'debit');
+        const calculatedOpening = finalSigned - (periodDebit - periodCredit);
 
         return {
             debitTotal: periodDebit,
@@ -674,153 +554,140 @@ const calculateCustomerBalance = async (customerId, customerName, openingBalance
     }
 };
 
+
 // Calculate vendor balance from vouchers and purchases up to asOnDate
-// Calculate vendor balance from vouchers and purchases up to asOnDate
-const calculateVendorBalance = async (vendorId, vendorName, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedStocks = null) => {
+// Calculate vendor balance (using logic from getVendorLedger)
+const calculateVendorBalance = (vendorDoc, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedStocks = null, preFetchedIndirectSales = null) => {
     try {
-        let periodDebit = 0;
-        let periodCredit = 0;
+        let periodDebit = 0; // Payable Decreases (Payments)
+        let periodCredit = 0; // Payable Increases (Purchases)
         let birdsTotal = 0;
         let weightTotal = 0;
-        let openingMovement = 0; // Vendors usually have Credit opening balance (negative in signed calc)
+        let discountAndOther = 0;
 
         const start = startDate ? new Date(startDate) : null;
         const end = endDate ? new Date(endDate) : null;
+        if (end) end.setHours(23, 59, 59, 999);
 
-        // Get vouchers
-        let vouchers = preFetchedVouchers;
-        if (!vouchers) {
-            const voucherQuery = {
-                isActive: true,
-                // status: 'posted'
-            };
-            if (end) {
-                voucherQuery.date = { $lte: end };
-            }
-            vouchers = await Voucher.find(voucherQuery).lean();
-        }
+        const vendorId = vendorDoc._id;
+        const vendorName = vendorDoc.vendorName;
 
-        // Process vouchers
-        vouchers.forEach(voucher => {
-            const vDate = new Date(voucher.date);
-            if (end && vDate > end) return;
-            // if (voucher.status !== 'posted') return;
+        // 1. Vouchers
+        if (Array.isArray(preFetchedVouchers)) {
+            preFetchedVouchers.forEach(v => {
+                const vDate = new Date(v.date);
+                if (end && vDate > end) return;
+                const isInPeriod = (!start || vDate >= start);
 
-            const isBeforeStart = start && vDate < start;
-            let vDebit = 0;
-            let vCredit = 0;
+                if (isInPeriod) {
+                    let amount = 0;
+                    let type = 'debit';
 
-            // Check Payment/Receipt vouchers with parties array
-            if ((voucher.voucherType === 'Payment' || voucher.voucherType === 'Receipt') && voucher.parties) {
-                voucher.parties.forEach(party => {
-                    if (party.partyId && party.partyId.toString() === vendorId.toString() && party.partyType === 'vendor') {
-                        if (voucher.voucherType === 'Payment') {
-                            // Payment: vendor balance increases (debit to vendor - we owe them more)
-                            vDebit += party.amount || 0;
-                        } else if (voucher.voucherType === 'Receipt') {
-                            // Receipt: vendor balance decreases (credit to vendor - we pay them)
-                            vCredit += party.amount || 0;
+                    if (v.voucherType === 'Journal') {
+                        const entry = v.entries?.find(e => e.account === vendorName);
+                        if (entry) {
+                            if (entry.creditAmount > 0) {
+                                amount = entry.creditAmount;
+                                type = 'credit';
+                            } else {
+                                amount = entry.debitAmount;
+                                type = 'debit';
+                            }
+                        }
+                    } else {
+                        // Payment/Receipt
+                        let isMatch = false;
+                        if (v.parties && v.parties.length > 0) {
+                            const partyEntry = v.parties.find(p => p.partyId && p.partyId.toString() === vendorId.toString() && p.partyType === 'vendor');
+                            if (partyEntry) {
+                                amount = partyEntry.amount || 0;
+                                isMatch = true;
+                            }
+                        } else if (v.party && v.party.toString() === vendorId.toString()) { // Old schema support
+                            amount = v.totalDebit || v.totalCredit;
+                            isMatch = true;
+                        }
+
+                        if (isMatch) {
+                            // Payment/Receipt usually reduces payable -> Debit
+                            type = 'debit';
                         }
                     }
-                });
-            }
 
-            // Check entries array for vendor name match
-            voucher.entries.forEach(entry => {
-                if (entry.account && entry.account.trim().toLowerCase() === vendorName.trim().toLowerCase()) {
-                    vDebit += entry.debitAmount || 0;
-                    vCredit += entry.creditAmount || 0;
-                }
-            });
-
-            if (isBeforeStart) {
-                openingMovement += (vDebit - vCredit);
-            } else {
-                periodDebit += vDebit;
-                periodCredit += vCredit;
-            }
-        });
-
-        // Get trips
-        let trips = preFetchedTrips;
-        if (!trips) {
-            const tripQuery = {
-                'purchases.supplier': vendorId
-            };
-            if (end) {
-                tripQuery.createdAt = { $lte: end };
-            }
-            trips = await Trip.find(tripQuery).lean();
-        }
-
-        trips.forEach(trip => {
-            const tDate = new Date(trip.createdAt);
-            if (end && tDate > end) return;
-
-            const isBeforeStart = start && tDate < start;
-            let tDebit = 0;
-            let tCredit = 0;
-
-            trip.purchases.forEach(purchase => {
-                if (purchase.supplier && purchase.supplier.toString() === vendorId.toString()) {
-                    // Purchases increase vendor balance (Credit to Vendor)
-                    tCredit += purchase.amount || 0;
-
-                    if (!isBeforeStart) {
-                        // Add birds and weight only for period
-                        birdsTotal += purchase.birds || 0;
-                        weightTotal += purchase.weight || 0;
+                    if (amount > 0) {
+                        if (type === 'credit') {
+                            periodCredit += amount;
+                            if (v.voucherType === 'Journal' || v.voucherType === 'Receipt') discountAndOther += amount;
+                        } else {
+                            periodDebit += amount;
+                        }
                     }
                 }
             });
-
-            if (isBeforeStart) {
-                openingMovement += (tDebit - tCredit); // Purchases are credit, so this will be negative
-            } else {
-                periodDebit += tDebit;
-                periodCredit += tCredit;
-            }
-        });
-
-        // Get Inventory Stocks (Feed Purchases, Opening Stock, etc.)
-        let stocks = preFetchedStocks;
-        if (!stocks) {
-            const stockQuery = {
-                vendorId: vendorId,
-                // type: { $in: ['purchase', 'opening'] }
-            };
-            if (end) {
-                stockQuery.date = { $lte: end };
-            }
-            stocks = await InventoryStock.find(stockQuery).lean();
         }
 
-        if (Array.isArray(stocks)) {
-            stocks.forEach(stock => {
+        // 2. Trips (Purchases)
+        if (Array.isArray(preFetchedTrips)) {
+            preFetchedTrips.forEach(trip => {
+                const tDate = new Date(trip.createdAt);
+                if (end && tDate > end) return;
+                const isInPeriod = (!start || tDate >= start);
+
+                if (isInPeriod) {
+                    trip.purchases.forEach(purchase => {
+                        if (purchase.supplier && purchase.supplier.toString() === vendorId.toString()) {
+                            let purchaseAmount = purchase.amount || 0;
+                            // Check TDS
+                            if (vendorDoc.tdsApplicable && (vendorDoc.tdsUpdatedAt && new Date(trip.date) > new Date(vendorDoc.tdsUpdatedAt))) {
+                                const tds = purchaseAmount * 0.001;
+                                // TDS reduces amount payable to vendor immediately?
+                                // In getVendorLedger: Running Balance += purchase.amount, then -= lessTDS.
+                                // So Purchase Amount is Credit. TDS is Debit.
+                                periodDebit += tds;
+                            }
+
+                            periodCredit += purchaseAmount;
+                            birdsTotal += purchase.birds || 0;
+                            weightTotal += purchase.weight || 0;
+                        }
+                    });
+                }
+            });
+        }
+
+        // 3. Indirect Sales (Vendor is seller to company)
+        if (Array.isArray(preFetchedIndirectSales)) {
+            preFetchedIndirectSales.forEach(sale => {
+                const sDate = new Date(sale.date);
+                if (end && sDate > end) return;
+                const isInPeriod = (!start || sDate >= start);
+
+                if (isInPeriod && sale.vendor && sale.vendor.toString() === vendorId.toString()) {
+                    // Vendor sold to us -> We owe them -> Credit
+                    periodCredit += sale.summary?.totalPurchaseAmount || 0;
+                    birdsTotal += sale.summary?.totalPurchaseBirds || 0;
+                    weightTotal += sale.summary?.totalPurchaseWeight || 0;
+                }
+            });
+        }
+
+        // 4. Stocks (Purchases)
+        if (Array.isArray(preFetchedStocks)) {
+            preFetchedStocks.forEach(stock => {
                 const sDate = new Date(stock.date);
                 if (end && sDate > end) return;
+                const isInPeriod = (!start || sDate >= start);
 
-                // Ensure it belongs to this vendor (double check if preFetched)
                 const stockVendorId = stock.vendorId?._id || stock.vendorId;
-                if (!stockVendorId || stockVendorId.toString() !== vendorId.toString()) return;
+                if (isInPeriod && stockVendorId && stockVendorId.toString() === vendorId.toString()) {
+                    if (stock.type === 'purchase' || stock.type === 'opening') { // Typically purchase
+                        let stockAmount = stock.amount || 0;
+                        if (vendorDoc.tdsApplicable && (vendorDoc.tdsUpdatedAt && new Date(stock.date) > new Date(vendorDoc.tdsUpdatedAt))) {
+                            const tds = stockAmount * 0.001;
+                            periodDebit += tds;
+                        }
 
-                const isBeforeStart = start && sDate < start;
-                let sDebit = 0;
-                let sCredit = 0;
-
-                // Purchase or Opening Stock -> Credit to Vendor (Liability)
-                if (stock.type === 'purchase' || stock.type === 'opening') {
-                    sCredit += stock.amount || 0;
-                }
-
-                if (isBeforeStart) {
-                    openingMovement += (sDebit - sCredit);
-                } else {
-                    periodDebit += sDebit;
-                    periodCredit += sCredit;
-
-                    // Add birds/weight for period
-                    if (stock.type === 'purchase' || stock.type === 'opening') {
+                        periodCredit += stockAmount;
                         birdsTotal += stock.birds || 0;
                         weightTotal += stock.weight || 0;
                     }
@@ -828,53 +695,10 @@ const calculateVendorBalance = async (vendorId, vendorName, startDate = null, en
             });
         }
 
-
-        // Vendors don't have opening balance usually, but if they do:
-        // Start with opening balance (assuming 0 if not provided)
-        // Vendor opening balance is usually 'credit' (liability for us)
-        const openingBalance = 0; // Assuming vendors don't have explicit opening balance in this context
-        const openingBalanceType = 'credit'; // Default for vendors
-        const openingSigned = toSignedValue(openingBalance, openingBalanceType);
-        const calculatedOpening = openingSigned + openingMovement;
-        const finalSigned = calculatedOpening + periodDebit - periodCredit;
-
-        // Calculate Discount & Other
-        // Logic: Journal + Receipt (Money In). Exclude Payment (Money Out).
-        let discountAndOther = 0;
-
-        if (Array.isArray(vouchers)) {
-            vouchers.forEach(voucher => {
-                const vDate = new Date(voucher.date);
-                if (end && vDate > end) return;
-
-                let isMatch = false;
-                let amount = 0;
-
-                if (voucher.parties) {
-                    voucher.parties.forEach(party => {
-                        if (party.partyId && party.partyId.toString() === vendorId.toString() && party.partyType === 'vendor') {
-                            isMatch = true;
-                            amount += party.amount || 0;
-                        }
-                    });
-                }
-
-                if (!isMatch && voucher.entries) {
-                    voucher.entries.forEach(entry => {
-                        if (entry.account && entry.account.trim().toLowerCase() === vendorName.trim().toLowerCase()) {
-                            isMatch = true;
-                            amount += (entry.debitAmount || 0) + (entry.creditAmount || 0);
-                        }
-                    });
-                }
-
-                if (isMatch) {
-                    if (voucher.voucherType === 'Receipt' || voucher.voucherType === 'Journal') {
-                        discountAndOther += amount;
-                    }
-                }
-            });
-        }
+        const finalSigned = toSignedValue(vendorDoc.outstandingBalance || 0, vendorDoc.outstandingBalanceType || 'credit');
+        // Vendor Opening: Closing - (Credit - Debit)  [Net Increase - Net Decrease]
+        // Since Credit Increases balance for Vendor.
+        const calculatedOpening = finalSigned - (periodCredit - periodDebit);
 
         return {
             debitTotal: periodDebit,
@@ -890,6 +714,7 @@ const calculateVendorBalance = async (vendorId, vendorName, startDate = null, en
         return { debitTotal: 0, creditTotal: 0, finalBalance: 0, openingBalance: 0, birdsTotal: 0, weightTotal: 0 };
     }
 };
+
 
 // Recursive function to get all ledgers in a group (including subgroups)
 const getAllLedgersInGroup = async (groupId) => {
@@ -942,7 +767,7 @@ const getAllVendorsInGroup = async (groupId) => {
 
 // Calculate group debit/credit from all ledgers, customers, and vendors
 // OPTIMIZED: Uses pre-fetched data
-const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedStocks = null) => {
+const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedStocks = null, preFetchedIndirectSales = null) => {
     // Note: getAllLedgers/Customers/Vendors still do recursive DB calls. 
     // Optimization: We could optimize these formatted calls too, but passing vouchers down is the biggest win.
 
@@ -968,18 +793,13 @@ const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, e
 
     // Calculate from ledgers
     for (const ledger of allLedgers) {
-        const openingBalance = ledger.openingBalance || 0;
-        const openingBalanceType = ledger.openingBalanceType || 'debit';
-
         const ledgerBalance = await calculateLedgerBalance(
-            ledger._id,
-            ledger.name, // Pass ledger name
-            openingBalance,
-            openingBalanceType,
+            ledger,
             startDate,
             endDate,
             preFetchedVouchers,
-            preFetchedTrips
+            preFetchedTrips,
+            preFetchedStocks
         );
 
         const finalSigned = ledgerBalance.finalBalance;
@@ -1011,19 +831,14 @@ const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, e
 
     // Calculate from customers
     for (const customer of allCustomers) {
-        const openingBalance = customer.openingBalance || 0;
-        const openingBalanceType = customer.openingBalanceType || 'debit';
-        const customerName = customer.shopName || customer.ownerName || 'Customer';
-
         const customerBalance = await calculateCustomerBalance(
-            customer._id,
-            customerName,
-            openingBalance,
-            openingBalanceType,
+            customer,
             startDate,
             endDate,
             preFetchedVouchers,
-            preFetchedTrips
+            preFetchedTrips,
+            preFetchedIndirectSales,
+            preFetchedStocks
         );
 
         const finalSigned = customerBalance.finalBalance;
@@ -1056,16 +871,14 @@ const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, e
 
     // Calculate from vendors
     for (const vendor of allVendors) {
-        const vendorName = vendor.vendorName || 'Vendor';
-
         const vendorBalance = await calculateVendorBalance(
-            vendor._id,
-            vendorName,
+            vendor,
             startDate,
             endDate,
             preFetchedVouchers,
             preFetchedTrips,
-            preFetchedStocks
+            preFetchedStocks,
+            preFetchedIndirectSales
         );
 
         const finalSigned = vendorBalance.finalBalance;
@@ -1152,6 +965,13 @@ export const getGroupSummary = async (req, res, next) => {
         }
         const stocks = await InventoryStock.find(stockQuery).lean();
 
+        // Fetch Indirect Sales (was missing)
+        const indirectSaleQuery = {};
+        if (finalEndDate) {
+            indirectSaleQuery.date = { $lte: new Date(finalEndDate) };
+        }
+        const indirectSales = await IndirectSale.find(indirectSaleQuery).lean();
+
         const subGroups = await Group.find({ parentGroup: id, isActive: true }).sort({ name: 1 }).lean();
         const directLedgers = await Ledger.find({ group: id, isActive: true }).sort({ name: 1 }).lean();
         const directCustomers = await Customer.find({ group: id, isActive: true }).sort({ shopName: 1 }).lean();
@@ -1175,7 +995,8 @@ export const getGroupSummary = async (req, res, next) => {
                 finalEndDate,
                 vouchers,
                 trips,
-                stocks
+                stocks,
+                indirectSales
             );
 
             entries.push({
@@ -1199,14 +1020,12 @@ export const getGroupSummary = async (req, res, next) => {
             const openingBalanceType = ledger.openingBalanceType || 'debit';
 
             const ledgerBalance = await calculateLedgerBalance(
-                ledger._id,
-                ledger.name, // Pass ledger name
-                openingBalance,
-                openingBalanceType,
+                ledger,
                 finalStartDate,
                 finalEndDate,
                 vouchers,
-                trips
+                trips,
+                stocks
             );
 
             const finalSigned = ledgerBalance.finalBalance;
@@ -1261,14 +1080,13 @@ export const getGroupSummary = async (req, res, next) => {
             const customerName = customer.shopName || customer.ownerName || 'Customer';
 
             const customerBalance = await calculateCustomerBalance(
-                customer._id,
-                customerName,
-                openingBalance,
-                openingBalanceType,
+                customer,
                 finalStartDate,
                 finalEndDate,
                 vouchers,
-                trips
+                trips,
+                indirectSales,
+                stocks
             );
 
             const finalSigned = customerBalance.finalBalance;
@@ -1316,13 +1134,13 @@ export const getGroupSummary = async (req, res, next) => {
             const vendorName = vendor.vendorName || 'Vendor';
 
             const vendorBalance = await calculateVendorBalance(
-                vendor._id,
-                vendorName,
+                vendor,
                 finalStartDate,
                 finalEndDate,
                 vouchers,
                 trips,
-                stocks
+                stocks,
+                indirectSales
             );
 
             const finalSigned = vendorBalance.finalBalance;
