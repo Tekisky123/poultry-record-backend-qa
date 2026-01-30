@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import {config} from 'dotenv';
+import { config } from 'dotenv';
 
 config({ path: `${process.cwd()}/src/.env` });
 

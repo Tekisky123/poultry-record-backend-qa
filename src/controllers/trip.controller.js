@@ -7,7 +7,7 @@ import AppError from "../utils/AppError.js";
 import { successResponse } from "../utils/responseHandler.js";
 import { addToBalance, subtractFromBalance, toSignedValue, fromSignedValue } from "../utils/balanceUtils.js";
 import { addSaleWhatsappMessage } from "../utils/addSaleWhatsappMessage.js";
-import { sendSaleSms, sendReceiptSms } from "../services/sms.service.js";
+import sendSMS from "../services/sendSMS.js";
 
 const buildTransferPopulate = (depth = 3) => {
     if (depth <= 0) return null;
@@ -572,28 +572,25 @@ export const addSale = async (req, res, next) => {
 
                 if (isReceipt) {
                     // For receipt, amount is the total paid
-                    const totalPaid = (newSale.cashPaid || 0) + (newSale.onlinePaid || 0);
-                    if (totalPaid > 0) {
-                        try {
-                            await sendReceiptSms(
-                                customerName,
-                                totalPaid,
-                                newSale.billNumber,
-                                newSale.date || new Date(),
-                                mobileNumber
-                            );
-                        } catch (smsError) {
-                            console.error('Failed to send Receipt SMS:', smsError);
-                        }
-                    }
+                    // const totalPaid = (newSale.cashPaid || 0) + (newSale.onlinePaid || 0);
+                    // if (totalPaid > 0) {
+                    //     try {
+                    //         await sendSMS(
+                    //             'add_sales',
+                    //             [customerName, totalPaid, newSale.billNumber],
+                    //             mobileNumber
+                    //         );
+                    //     } catch (smsError) {
+                    //         console.error('Failed to send Receipt SMS:', smsError);
+                    //     }
+                    // }
                 } else {
                     // For sale
+                    console.log("mobileNumber add sale", mobileNumber)
                     try {
-                        await sendSaleSms(
-                            customerName,
-                            newSale.amount,
-                            newSale.billNumber,
-                            newSale.date || new Date(),
+                        await sendSMS(
+                            'add_sales',
+                            [customerName, newSale.billNumber],
                             mobileNumber
                         );
                     } catch (smsError) {
@@ -1042,27 +1039,23 @@ export const editSale = async (req, res, next) => {
                     (updatedSale.amount === 0 || !updatedSale.amount);
 
                 if (isReceipt) {
-                    const totalPaid = (updatedSale.cashPaid || 0) + (updatedSale.onlinePaid || 0);
-                    if (totalPaid > 0) {
-                        try {
-                            await sendReceiptSms(
-                                customerName,
-                                totalPaid,
-                                updatedSale.billNumber,
-                                updatedSale.date || new Date(),
-                                mobileNumber
-                            );
-                        } catch (smsError) {
-                            console.error('Failed to send Receipt SMS (Edit):', smsError);
-                        }
-                    }
+                    // const totalPaid = (updatedSale.cashPaid || 0) + (updatedSale.onlinePaid || 0);
+                    // if (totalPaid > 0) {
+                    //     try {
+                    //         await sendSMS(
+                    //             'add_sales',
+                    //             [customerName, updatedSale.billNumber],
+                    //             mobileNumber
+                    //         );
+                    //     } catch (smsError) {
+                    //         console.error('Failed to send Receipt SMS (Edit):', smsError);
+                    //     }
+                    // }
                 } else {
                     try {
-                        await sendSaleSms(
-                            customerName,
-                            updatedSale.amount,
-                            updatedSale.billNumber,
-                            updatedSale.date || new Date(),
+                        await sendSMS(
+                            'update_sales',
+                            [customerName, updatedSale.billNumber],
                             mobileNumber
                         );
                     } catch (smsError) {

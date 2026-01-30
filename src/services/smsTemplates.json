@@ -1,0 +1,20 @@
+[
+    {
+        "template_id": "206535",
+        "template_name": "add_sales",
+        "sender_id": "TEKSKY",
+        "language": "english",
+        "route": "dlt",
+        "flash": 0,
+        "template": "Dear {#VAR#}, thank you for purchasing with us. Your invoice no.{#VAR#}. Tekisky Private Limited."
+    },
+    {
+        "template_id": "206536",
+        "template_name": "update_sales",
+        "sender_id": "TEKSKY",
+        "language": "english",
+        "route": "dlt",
+        "flash": 0,
+        "template": "Dear {#VAR#}, your purchase invoice no.{#VAR#} has been updated successfully. Tekisky Private Limited."
+    }
+]

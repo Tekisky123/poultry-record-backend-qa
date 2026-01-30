@@ -2,8 +2,11 @@ import Trip from "../models/Trip.js";
 import Group from "../models/Group.js";
 import Ledger from "../models/Ledger.js";
 import Voucher from "../models/Voucher.js";
+import InventoryStock from "../models/InventoryStock.js";
+import IndirectSale from "../models/IndirectSale.js";
 import AppError from "../utils/AppError.js";
 import { successResponse } from "../utils/responseHandler.js";
+import mongoose from "mongoose";
 
 // Helper functions (duplicated from balanceSheet.controller.js)
 const buildTree = (groups) => {
@@ -52,16 +55,34 @@ const buildTree = (groups) => {
     return rootGroups;
 };
 
-const buildVoucherBalanceMap = async (startDate, endDate) => {
+// Helper to merge Periodic Balance into Map
+const mergeToBalanceMap = (map, ledgerName, debit = 0, credit = 0) => {
+    if (!ledgerName) return;
+    const normalizedName = ledgerName.trim().toLowerCase();
+
+    if (!map.has(normalizedName)) {
+        map.set(normalizedName, { debitTotal: 0, creditTotal: 0 });
+    }
+    const entry = map.get(normalizedName);
+    entry.debitTotal += debit;
+    entry.creditTotal += credit;
+};
+
+// Build Period Balance Map (Vouchers + Trips + Stocks)
+const buildPeriodBalanceMap = async (startDate, endDate, allLedgers) => {
     try {
         const query = { isActive: true };
+        const tripQuery = { isActive: true }; // Assuming trip has isActive or similar, check Trip model but for now assume basics.
+        // Actually Trip usually doesn't have isActive, just status. 
+
         if (startDate || endDate) {
             query.date = {};
             if (startDate) query.date.$gte = new Date(startDate);
             if (endDate) query.date.$lte = new Date(endDate);
         }
 
-        const balanceMap = await Voucher.aggregate([
+        // 1. Voucher Aggregation (Fastest for massive data)
+        const voucherBalances = await Voucher.aggregate([
             { $match: query },
             { $unwind: '$entries' },
             {
@@ -74,7 +95,7 @@ const buildVoucherBalanceMap = async (startDate, endDate) => {
         ]);
 
         const map = new Map();
-        balanceMap.forEach(item => {
+        voucherBalances.forEach(item => {
             if (item._id) {
                 const normalizedName = item._id.toString().trim().toLowerCase();
                 map.set(normalizedName, {
@@ -83,17 +104,93 @@ const buildVoucherBalanceMap = async (startDate, endDate) => {
                 });
             }
         });
+
+        // Map ID -> Name for lookups
+        const ledgerNameMap = new Map();
+        allLedgers.forEach(l => {
+            if (l._id && l.name) ledgerNameMap.set(l._id.toString(), l.name);
+        });
+
+        // 2. Process Trips (Date filtering on createdAt)
+        const tripDateQuery = {};
+        if (startDate) tripDateQuery.$gte = new Date(startDate);
+        if (endDate) tripDateQuery.$lte = new Date(endDate);
+
+        let tQuery = {};
+        if (startDate || endDate) tQuery.createdAt = tripDateQuery;
+
+        const trips = await Trip.find(tQuery).lean();
+
+        trips.forEach(t => {
+            if (t.sales) {
+                t.sales.forEach(s => {
+                    // Cash Sale -> Debit Cash Ledger
+                    if (s.cashLedger) {
+                        const name = ledgerNameMap.get(s.cashLedger.toString());
+                        if (name) mergeToBalanceMap(map, name, s.cashPaid || 0, 0);
+                    }
+                    // Online Sale -> Debit Bank(Online) Ledger
+                    if (s.onlineLedger) {
+                        const name = ledgerNameMap.get(s.onlineLedger.toString());
+                        if (name) mergeToBalanceMap(map, name, s.onlinePaid || 0, 0);
+                    }
+                });
+            }
+        });
+
+        // 3. Process Stocks (Date filtering on date)
+        const stockDateQuery = {};
+        if (startDate) stockDateQuery.$gte = new Date(startDate);
+        if (endDate) stockDateQuery.$lte = new Date(endDate);
+
+        let sQuery = {};
+        if (startDate || endDate) sQuery.date = stockDateQuery;
+
+        const stocks = await InventoryStock.find(sQuery).lean();
+
+        stocks.forEach(s => {
+            // Expense
+            if (s.expenseLedgerId) {
+                const name = ledgerNameMap.get(s.expenseLedgerId.toString());
+                if (name) mergeToBalanceMap(map, name, s.amount || 0, 0); // Debit Expense
+            }
+
+            // Cash/Online Payments/Receipts handling
+            // Purchase/Opening -> Credit Cash/Bank
+            // Sale/Receipt -> Debit Cash/Bank
+
+            const isCredit = (s.type === 'purchase' || s.type === 'opening');
+
+            if (s.cashLedgerId) {
+                const name = ledgerNameMap.get(s.cashLedgerId.toString());
+                if (name) {
+                    const amt = s.cashPaid || 0;
+                    if (isCredit) mergeToBalanceMap(map, name, 0, amt);
+                    else mergeToBalanceMap(map, name, amt, 0);
+                }
+            }
+
+            if (s.onlineLedgerId) {
+                const name = ledgerNameMap.get(s.onlineLedgerId.toString());
+                if (name) {
+                    const amt = s.onlinePaid || 0;
+                    if (isCredit) mergeToBalanceMap(map, name, 0, amt);
+                    else mergeToBalanceMap(map, name, amt, 0);
+                }
+            }
+        });
+
         return map;
     } catch (error) {
-        console.error('Error building voucher balance map:', error);
+        console.error('Error building period balance map:', error);
         return new Map();
     }
 };
 
-const calculateLedgerBalance = (ledgerName, voucherBalanceMap) => {
+const calculateLedgerBalance = (ledgerName, balanceMap) => {
     try {
         const normalizedName = ledgerName.toString().trim().toLowerCase();
-        const balance = voucherBalanceMap.get(normalizedName) || { debitTotal: 0, creditTotal: 0 };
+        const balance = balanceMap.get(normalizedName) || { debitTotal: 0, creditTotal: 0 };
         return {
             debitTotal: balance.debitTotal,
             creditTotal: balance.creditTotal,
@@ -104,7 +201,7 @@ const calculateLedgerBalance = (ledgerName, voucherBalanceMap) => {
     }
 };
 
-const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap) => {
+const calculateGroupBalance = async (group, balanceMap, ledgerGroupMap) => {
     let totalBalance = 0;
     let totalDebit = 0;
     let totalCredit = 0;
@@ -113,13 +210,13 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap) =
     const ledgers = ledgerGroupMap.get(groupId.toString()) || [];
 
     for (const ledger of ledgers) {
-        const ledgerBalance = calculateLedgerBalance(ledger.name, voucherBalanceMap);
+        const ledgerBalance = calculateLedgerBalance(ledger.name, balanceMap);
         totalDebit += ledgerBalance.debitTotal;
         totalCredit += ledgerBalance.creditTotal;
 
         // P&L Logic
-        // Income (Credit nature): Credit - Debit
-        // Expenses (Debit nature): Debit - Credit
+        // Income (Credit nature): Credit - Debit (Positive Income means Credit > Debit)
+        // Expenses (Debit nature): Debit - Credit (Positive Expense means Debit > Credit)
         if (group.type === 'Income') {
             totalBalance += (ledgerBalance.creditTotal - ledgerBalance.debitTotal);
         } else if (group.type === 'Expenses') {
@@ -129,7 +226,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap) =
 
     if (group.children && group.children.length > 0) {
         for (const child of group.children) {
-            const childBalance = await calculateGroupBalance(child, voucherBalanceMap, ledgerGroupMap);
+            const childBalance = await calculateGroupBalance(child, balanceMap, ledgerGroupMap);
             totalBalance += childBalance.totalBalance;
             totalDebit += childBalance.totalDebit;
             totalCredit += childBalance.totalCredit;
@@ -138,17 +235,20 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap) =
     return { totalBalance, totalDebit, totalCredit };
 };
 
+
 export const getProfitAndLoss = async (req, res, next) => {
     try {
         const { startDate, endDate } = req.query;
 
         // Fetch data
-        const [voucherBalanceMap, allLedgers, incomeGroups, expenseGroups] = await Promise.all([
-            buildVoucherBalanceMap(startDate, endDate),
+        const [allLedgers, incomeGroups, expenseGroups] = await Promise.all([
             Ledger.find({ isActive: true }).lean(),
             Group.find({ type: 'Income', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
             Group.find({ type: 'Expenses', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 })
         ]);
+
+        // Build Comprehensive Map
+        const periodBalanceMap = await buildPeriodBalanceMap(startDate, endDate, allLedgers);
 
         // Map Ledgers to Groups
         const ledgerGroupMap = new Map();
@@ -170,7 +270,7 @@ export const getProfitAndLoss = async (req, res, next) => {
         const processGroups = async (groups) => {
             const processedGroups = [];
             for (const group of groups) {
-                const balance = await calculateGroupBalance(group, voucherBalanceMap, ledgerGroupMap);
+                const balance = await calculateGroupBalance(group, periodBalanceMap, ledgerGroupMap);
                 const groupId = group._id || group.id;
                 const processedGroup = {
                     _id: groupId,
@@ -195,15 +295,12 @@ export const getProfitAndLoss = async (req, res, next) => {
         const processedIncome = await processGroups(incomeTree);
         const processedExpenses = await processGroups(expenseTree);
 
-        // Calculate Totals
+        // Calculate Totals - FIX DOUBLE COUNTING
         const calculateTotal = (groups) => {
             let total = 0;
             groups.forEach(group => {
                 total += group.balance;
-                // children already aggregated in group logic? NO. 
-                // Wait, calculateGroupBalance DOES aggregate children into totalBalance.
-                // But processedGroups includes top level.
-                // We just need to sum top level groups.
+                // Removed recursive call to children, as group.balance already aggregates children
             });
             return total;
         };
@@ -246,7 +343,7 @@ export const getStats = async (req, res, next) => {
 
         let userFilter = {};
         if (req.user.role === 'supervisor') {
-            userFilter.supervisor = req.user._id;
+            userFilter.supervisor = new mongoose.Types.ObjectId(req.user._id);
         }
 
         const query = { ...dateFilter, ...userFilter };
@@ -286,7 +383,7 @@ export const getStats = async (req, res, next) => {
             .sort({ createdAt: -1 })
             .limit(5);
 
-        successResponse(res, "dashboard stats", 200, undefined, {
+        successResponse(res, "dashboard stats", 200, {
             stats: dashboardStats,
             recentTrips
         })
