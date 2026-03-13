@@ -7,6 +7,7 @@ import Trip from "../models/Trip.js";
 import AppError from "../utils/AppError.js";
 import { successResponse } from "../utils/responseHandler.js";
 import { addToBalance, subtractFromBalance, toSignedValue, fromSignedValue } from "../utils/balanceUtils.js";
+import sendSMS from "../services/sendSMS.js";
 
 // Add Purchase to Inventory
 export const addPurchase = async (req, res, next) => {
@@ -200,6 +201,7 @@ export const addConsume = async (req, res, next) => {
 export const addSale = async (req, res, next) => {
     try {
         let saleData = req.body;
+        const sendSms = req.body.sendSms; // Extract SMS flag
 
         saleData = {
             ...saleData,
@@ -327,8 +329,22 @@ export const addSale = async (req, res, next) => {
         }
 
         const populatedStock = await InventoryStock.findById(stock._id)
-            .populate("customerId", "shopName ownerName")
+            .populate("customerId", "shopName ownerName contact")
             .populate("supervisorId", "name");
+
+        if (sendSms && populatedStock.customerId) {
+            const customerName = populatedStock.customerId.shopName || populatedStock.customerId.ownerName || 'Customer';
+            const mobileNumber = populatedStock.customerId.contact;
+            try {
+                await sendSMS(
+                    'add_sales',
+                    [customerName, populatedStock.billNumber || ''],
+                    mobileNumber
+                );
+            } catch (smsError) {
+                console.error('Failed to send Sale SMS:', smsError);
+            }
+        }
 
         successResponse(res, "Sale added successfully", 201, populatedStock);
     } catch (error) {
@@ -340,6 +356,7 @@ export const addSale = async (req, res, next) => {
 export const addReceipt = async (req, res, next) => {
     try {
         let receiptData = req.body;
+        // const sendSms = req.body.sendSms; // Extract SMS flag (Not used yet for receipts)
 
         receiptData = {
             ...receiptData,
@@ -455,15 +472,20 @@ export const addReceipt = async (req, res, next) => {
 // Get All Stocks (Includes Trip Stocks)
 export const getStocks = async (req, res, next) => {
     try {
-        const { startDate, endDate, supervisor, type } = req.query;
+        const { startDate, endDate, supervisor, type, inventoryType } = req.query;
 
         let query = {};
         if (supervisor) query.supervisorId = supervisor;
         if (type) query.type = type;
+        if (inventoryType) query.inventoryType = inventoryType;
         if (startDate || endDate) {
             query.date = {};
             if (startDate) query.date.$gte = new Date(startDate);
-            if (endDate) query.date.$lte = new Date(endDate);
+            if (endDate) {
+                const end = new Date(endDate);
+                end.setHours(23, 59, 59, 999);
+                query.date.$lte = end;
+            }
         }
 
         // 1. Fetch InventoryStock
@@ -522,6 +544,9 @@ export const getStocks = async (req, res, next) => {
             if (endDate) {
                 tripStocks = tripStocks.filter(s => new Date(s.date) <= new Date(endDate));
             }
+            if (inventoryType) {
+                tripStocks = tripStocks.filter(s => s.inventoryType === inventoryType);
+            }
         }
 
         // Combine and Sort
@@ -538,6 +563,7 @@ export const updateStock = async (req, res, next) => {
     const { id } = req.params;
     try {
         const updates = req.body;
+        const sendSms = req.body.sendSms; // Extract SMS flag
 
         // 1. Fetch existing stock
         const oldStock = await InventoryStock.findById(id);
@@ -752,9 +778,23 @@ export const updateStock = async (req, res, next) => {
             updatedBy: req.user._id
         }, { new: true })
             .populate("vendorId", "vendorName")
-            .populate("customerId", "shopName ownerName")
+            .populate("customerId", "shopName ownerName contact")
             .populate("vehicleId", "vehicleNumber")
             .populate("supervisorId", "name");
+
+        if (sendSms && updatedStock.customerId && (updatedStock.type === 'sale')) {
+            const customerName = updatedStock.customerId.shopName || updatedStock.customerId.ownerName || 'Customer';
+            const mobileNumber = updatedStock.customerId.contact;
+            try {
+                await sendSMS(
+                    'update_sales',
+                    [customerName, updatedStock.billNumber || ''],
+                    mobileNumber
+                );
+            } catch (smsError) {
+                console.error('Failed to send Update Sale SMS:', smsError);
+            }
+        }
 
         successResponse(res, "Stock updated successfully", 200, updatedStock);
 
@@ -779,8 +819,8 @@ export const getMonthlyStockStats = async (req, res, next) => {
             {
                 $match: {
                     date: {
-                        $gte: new Date(`${currentYear}-01-01`),
-                        $lte: new Date(`${currentYear}-12-31`)
+                        $gte: new Date(`${currentYear}-04-01`),
+                        $lte: new Date(`${currentYear + 1}-03-31`)
                     }
                 }
             },

@@ -12,7 +12,7 @@ const smsTemplates = require('./smsTemplates.json');
  * @param {string|string[]} numbers - Single number or array of numbers
  * @returns {Promise<Object>} Response data from Fast2SMS
  */
-const sendSMS = async (template_name, variables_values, numbers) => {
+const sendSMS = async (payload) => {
     try {
         // Check DB setting first
         const smsSetting = await Setting.findOne({ key: 'SMS_ENABLED' });
@@ -32,29 +32,8 @@ const sendSMS = async (template_name, variables_values, numbers) => {
             return null;
         }
 
-        if (!template_name || !numbers) {
-            console.warn("No template name or mobile numbers provided");
-            return null;
-        }
-
-        const template = smsTemplates.find(t => t.template_name === template_name);
-        if (!template) {
-            console.warn('Template not found for template_name:', template_name);
-            return null;
-        }
-
-
-        const payload = {
-            route: template.route || "dlt",
-            message: template.template_id,
-            variables_values: Array.isArray(variables_values) ? variables_values.join('|') : variables_values,
-            sender_id: template.sender_id,
-            language: template.language,
-            flash: template.flash,
-            numbers: Array.isArray(numbers) ? numbers.join(',') : numbers,
-        };
-        // console.log("payload", payload);
-        // return null
+        console.log("payload", payload);
+        return null
 
         const response = await axios.post('https://www.fast2sms.com/dev/bulkV2', payload, {
             headers: {

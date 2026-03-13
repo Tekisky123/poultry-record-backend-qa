@@ -17,6 +17,7 @@ import balanceSheetRouter from './balanceSheet.routes.js';
 import securityRouter from './security.routes.js';
 import settingRouter from './setting.routes.js';
 import inventoryStockRouter from './inventoryStock.routes.js';
+// import sendAddSaleSMS from '../services/sms/sendAddSaleSMS.js';
 
 router.use('/auth', authRouter);
 router.use('/user', userRouter);
@@ -35,5 +36,17 @@ router.use('/balance-sheet', balanceSheetRouter);
 router.use('/security', securityRouter);
 router.use('/settings', settingRouter);
 router.use('/inventory-stock', inventoryStockRouter);
+// router.get('/test', (req, res) => {
+//     sendAddSaleSMS("7414969691", {
+//         customerName: "Tauhid Shaikh",
+//         date: "2022-01-01",
+//         invoiceNo: "123456",
+//         birds: "100",
+//         weight: "100",
+//         amount: "100",
+//         balance: "100"
+//     });
+//     return res.json({ status: 'OK', timestamp: new Date().toISOString() });
+// });
 
 export default router;

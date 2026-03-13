@@ -3,6 +3,7 @@ import Vehicle from "../models/Vehicle.js";
 import User from "../models/User.js";
 import Customer from "../models/Customer.js";
 import Ledger from "../models/Ledger.js";
+import DieselStation from "../models/DieselStation.js";
 import AppError from "../utils/AppError.js";
 import { successResponse } from "../utils/responseHandler.js";
 import { addToBalance, subtractFromBalance, toSignedValue, fromSignedValue } from "../utils/balanceUtils.js";
@@ -1155,6 +1156,7 @@ export const addDeathBirds = async (req, res, next) => {
 };
 
 // Update trip diesel (Supervisor)
+// Update trip diesel (Supervisor)
 export const updateTripDiesel = async (req, res, next) => {
     try {
         const { stations } = req.body;
@@ -1168,9 +1170,59 @@ export const updateTripDiesel = async (req, res, next) => {
 
         if (!trip) throw new AppError('Trip not found!', 404);
 
+        // 1. Revert Old Entries
+        for (const oldStation of trip.diesel.stations) {
+            // Case B: Predefined Diesel Station
+            if (oldStation.dieselStation && oldStation.amount > 0) {
+                try {
+                    const station = await DieselStation.findById(oldStation.dieselStation);
+                    if (station) {
+                        // Reversing a Purchase (Credit) -> Debit (Decrease Liability/Balance)
+                        // Diesel Stations are usually Credit balance (Vendor).
+                        // Purchase increases Cr. Revert decreases Cr (Debit).
+                        const currentBalance = Number(station.outstandingBalance) || 0;
+                        const currentType = station.outstandingBalanceType || 'credit'; // Default to credit for vendors
+                        const newBalance = addToBalance(currentBalance, currentType, oldStation.amount, 'debit');
+
+                        station.outstandingBalance = newBalance.amount;
+                        station.outstandingBalanceType = newBalance.type;
+                        await station.save();
+                    }
+                } catch (err) {
+                    console.error('Error reverting old diesel station balance:', err);
+                }
+            }
+        }
+
+        // 2. Apply New Entries
+        for (const newStation of stations) {
+            // Case B: Predefined Diesel Station
+            if (newStation.dieselStation && newStation.amount > 0) {
+                try {
+                    const station = await DieselStation.findById(newStation.dieselStation);
+                    if (station) {
+                        // Applying a Purchase (Credit) -> Credit (Increase Liability/Balance)
+                        const currentBalance = Number(station.outstandingBalance) || 0;
+                        // Use existing type or default to 'credit' if it was 0/undefined, but usually it has a type
+                        const currentType = station.outstandingBalanceType || 'credit';
+
+                        const newBalance = addToBalance(currentBalance, currentType, newStation.amount, 'credit');
+
+                        station.outstandingBalance = newBalance.amount;
+                        station.outstandingBalanceType = newBalance.type;
+                        await station.save();
+                    }
+                } catch (err) {
+                    console.error('Error applying new diesel station balance:', err);
+                }
+            }
+        }
+
         trip.diesel.stations = stations;
         trip.diesel.totalVolume = stations.reduce((sum, station) => sum + (station.volume || 0), 0);
         trip.diesel.totalAmount = stations.reduce((sum, station) => sum + (station.amount || 0), 0);
+        trip.summary.totalDieselAmount = trip.diesel.totalAmount;
+
         trip.updatedBy = req.user._id;
         trip.updatedAt = new Date();
 
@@ -1270,14 +1322,59 @@ export const editDieselStation = async (req, res, next) => {
             throw new AppError('Invalid diesel station index', 400);
         }
 
+        const oldStation = trip.diesel.stations[stationIndex];
+        const oldStationObj = oldStation.toObject();
+
+        // 1. Revert Old Entries
+        // Case B: Predefined Diesel Station
+        if (oldStation.dieselStation && oldStation.amount > 0) {
+            try {
+                const station = await DieselStation.findById(oldStation.dieselStation);
+                if (station) {
+                    // Reversing Purchase (Credit) -> Debit
+                    const currentBalance = Number(station.outstandingBalance) || 0;
+                    const currentType = station.outstandingBalanceType || 'credit';
+                    const newBalance = addToBalance(currentBalance, currentType, oldStation.amount, 'debit');
+
+                    station.outstandingBalance = newBalance.amount;
+                    station.outstandingBalanceType = newBalance.type;
+                    await station.save();
+                }
+            } catch (err) {
+                console.error('Error reverting old diesel station balance:', err);
+            }
+        }
+
         // Update diesel station
-        trip.diesel.stations[stationIndex] = { ...trip.diesel.stations[stationIndex], ...stationData };
+        // Merge old data with new data
+        trip.diesel.stations[stationIndex] = { ...oldStationObj, ...stationData };
+
+        const newStation = trip.diesel.stations[stationIndex];
+
+        // 2. Apply New Entries
+        // Case B: Predefined Diesel Station
+        if (newStation.dieselStation && newStation.amount > 0) {
+            try {
+                const station = await DieselStation.findById(newStation.dieselStation);
+                if (station) {
+                    // Applying Purchase (Credit) -> Credit
+                    const currentBalance = Number(station.outstandingBalance) || 0;
+                    const currentType = station.outstandingBalanceType || 'credit';
+
+                    const newBalance = addToBalance(currentBalance, currentType, newStation.amount, 'credit');
+
+                    station.outstandingBalance = newBalance.amount;
+                    station.outstandingBalanceType = newBalance.type;
+                    await station.save();
+                }
+            } catch (err) {
+                console.error('Error applying new diesel station balance:', err);
+            }
+        }
 
         // Update diesel totals
         trip.diesel.totalVolume = trip.diesel.stations.reduce((sum, station) => sum + (station.volume || 0), 0);
         trip.diesel.totalAmount = trip.diesel.stations.reduce((sum, station) => sum + (station.amount || 0), 0);
-
-        // Update summary
         trip.summary.totalDieselAmount = trip.diesel.totalAmount;
 
         trip.updatedBy = req.user._id;

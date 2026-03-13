@@ -38,6 +38,7 @@ const inventoryStockSchema = new mongoose.Schema({
 
   refNo: String, // bill / dc / challan
   notes: String,
+  narration: String,
 
   supervisorId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   vehicleId: { type: mongoose.Schema.Types.ObjectId, ref: "Vehicle" },

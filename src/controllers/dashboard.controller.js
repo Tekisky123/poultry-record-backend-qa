@@ -219,7 +219,7 @@ const calculateGroupBalance = async (group, balanceMap, ledgerGroupMap) => {
         // Expenses (Debit nature): Debit - Credit (Positive Expense means Debit > Credit)
         if (group.type === 'Income') {
             totalBalance += (ledgerBalance.creditTotal - ledgerBalance.debitTotal);
-        } else if (group.type === 'Expenses') {
+        } else if (group.type === 'Expenses' || group.type === 'Assets') {
             totalBalance += (ledgerBalance.debitTotal - ledgerBalance.creditTotal);
         }
     }
@@ -241,11 +241,24 @@ export const getProfitAndLoss = async (req, res, next) => {
         const { startDate, endDate } = req.query;
 
         // Fetch data
-        const [allLedgers, incomeGroups, expenseGroups] = await Promise.all([
+        const [allLedgers, incomeGroups, expenseGroups, stockGroups] = await Promise.all([
             Ledger.find({ isActive: true }).lean(),
             Group.find({ type: 'Income', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
-            Group.find({ type: 'Expenses', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 })
+            Group.find({ type: 'Expenses', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
+            Group.find({
+                name: { $in: ['Opening Stock', 'Closing Stock'] },
+                isActive: true
+            }).populate('parentGroup', 'name type slug').lean()
         ]);
+
+        // Route Stock Groups to respective sides (Opening -> Expenses, Closing -> Income)
+        stockGroups.forEach(group => {
+            if (group.name === 'Opening Stock') {
+                expenseGroups.push(group);
+            } else if (group.name === 'Closing Stock') {
+                incomeGroups.push(group);
+            }
+        });
 
         // Build Comprehensive Map
         const periodBalanceMap = await buildPeriodBalanceMap(startDate, endDate, allLedgers);

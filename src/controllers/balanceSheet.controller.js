@@ -5,6 +5,7 @@ import Vendor from "../models/Vendor.js";
 import InventoryStock from "../models/InventoryStock.js";
 import Voucher from "../models/Voucher.js";
 import Trip from "../models/Trip.js";
+import DieselStation from "../models/DieselStation.js";
 import { successResponse } from "../utils/responseHandler.js";
 import AppError from "../utils/AppError.js";
 import { toSignedValue } from "../utils/balanceUtils.js";
@@ -134,7 +135,11 @@ const calculateCustomerBalance = (customer) => {
 const calculateVendorBalance = (vendor) => {
   return toSignedValue(vendor.outstandingBalance || 0, vendor.outstandingBalanceType || 'credit');
 };
-const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, vendorGroupMap, customerGroupMap, allVouchers, allTrips, allStocks, asOnDate = null) => {
+const calculateDieselStationBalance = (station) => {
+  return toSignedValue(station.outstandingBalance || 0, station.outstandingBalanceType || 'credit');
+};
+
+const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, vendorGroupMap, customerGroupMap, dieselStationGroupMap, allVouchers, allTrips, allStocks, asOnDate = null) => {
   let totalBalance = 0;
   let totalDebit = 0;
   let totalCredit = 0;
@@ -209,10 +214,31 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
     }
   }
 
+  // Process diesel stations
+  const dieselStations = dieselStationGroupMap.get(groupId.toString()) || [];
+  for (const station of dieselStations) {
+    const balance = calculateDieselStationBalance(station);
+    // Diesel Station is typically a Creditor (Liability) -> credit balance is normal.
+    // Logic similar to vendors.
+    if (balance >= 0) {
+      totalDebit += balance;
+    } else {
+      totalCredit += Math.abs(balance);
+    }
+    totalOpeningBalance += station.openingBalance || 0;
+    // outstandingBalance logic might be complex, skipping for now or assume balance
+
+    if (group.type === 'Assets') {
+      totalBalance += balance;
+    } else if (group.type === 'Liability') {
+      totalBalance -= balance;
+    }
+  }
+
   // Recursively calculate children balances
   if (group.children && group.children.length > 0) {
     for (const child of group.children) {
-      const childBalance = await calculateGroupBalance(child, voucherBalanceMap, ledgerGroupMap, vendorGroupMap, customerGroupMap, allVouchers, allTrips, allStocks, asOnDate);
+      const childBalance = await calculateGroupBalance(child, voucherBalanceMap, ledgerGroupMap, vendorGroupMap, customerGroupMap, dieselStationGroupMap, allVouchers, allTrips, allStocks, asOnDate);
       totalBalance += childBalance.totalBalance;
       totalDebit += childBalance.totalDebit;
       totalCredit += childBalance.totalCredit;
@@ -280,7 +306,7 @@ export const getBalanceSheet = async (req, res, next) => {
     const dateQuery = date ? { date: { $lte: date } } : {};
     const createdQuery = date ? { createdAt: { $lte: date } } : {};
 
-    const [voucherBalanceMap, allLedgers, allVendors, allCustomers, allVouchers, allTrips, allStocks, assetsGroups, liabilityGroups] = await Promise.all([
+    const [voucherBalanceMap, allLedgers, allVendors, allCustomers, allVouchers, allTrips, allStocks, assetsGroups, liabilityGroups, allDieselStations] = await Promise.all([
       buildVoucherBalanceMap(date),
       Ledger.find({ isActive: true }).lean(),
       Vendor.find({ isActive: true }).lean(),
@@ -289,7 +315,8 @@ export const getBalanceSheet = async (req, res, next) => {
       Trip.find(createdQuery).lean(), // Trip uses createdAt
       InventoryStock.find({ ...dateQuery }).lean(), // InventoryStock uses date
       Group.find({ type: 'Assets', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
-      Group.find({ type: 'Liability', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 })
+      Group.find({ type: 'Liability', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
+      DieselStation.find({ isActive: true }).lean()
     ]);
 
     // Build Ledger Map (GroupId -> Ledgers)
@@ -322,6 +349,16 @@ export const getBalanceSheet = async (req, res, next) => {
       }
     });
 
+    // Build Diesel Station Map
+    const dieselStationGroupMap = new Map();
+    allDieselStations.forEach(station => {
+      if (station.group) {
+        const groupId = station.group.toString();
+        if (!dieselStationGroupMap.has(groupId)) dieselStationGroupMap.set(groupId, []);
+        dieselStationGroupMap.get(groupId).push(station);
+      }
+    });
+
     // Build tree structures
     const assetsTree = buildTree(assetsGroups);
     const liabilityTree = buildTree(liabilityGroups);
@@ -336,6 +373,7 @@ export const getBalanceSheet = async (req, res, next) => {
           ledgerGroupMap,
           vendorGroupMap,
           customerGroupMap,
+          dieselStationGroupMap,
           allVouchers,
           allTrips,
           allStocks,

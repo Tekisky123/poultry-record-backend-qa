@@ -2,9 +2,9 @@ import mongoose from "mongoose";
 import Sequence from "./Sequence.js";
 
 const tripSchema = new mongoose.Schema({
-    tripId: { 
-        type: String, 
-        required: false, 
+    tripId: {
+        type: String,
+        required: false,
         unique: true
     },
     // sequence: { 
@@ -35,10 +35,14 @@ const tripSchema = new mongoose.Schema({
         stations: [{
             name: String,
             stationName: String,
+            dieselStation: { type: mongoose.Schema.Types.ObjectId, ref: 'DieselStation' },
+            indentNumber: String,
             volume: Number,
             rate: Number,
             amount: Number,
             receipt: String,
+            paymentLedger: { type: mongoose.Schema.Types.ObjectId, ref: 'Ledger' },
+            narration: String,
             timestamp: { type: Date, default: Date.now }
         }],
         totalVolume: { type: Number, default: 0 },
@@ -52,9 +56,9 @@ const tripSchema = new mongoose.Schema({
 
     // Trip Expenses
     expenses: [{
-        category: { 
-            type: String, 
-            enum: ['parking','meals', 'toll', 'maintenance', 'tea', 'lunch', 'loading/unloading', 'other'],
+        category: {
+            type: String,
+            enum: ['parking', 'meals', 'toll', 'maintenance', 'tea', 'lunch', 'loading/unloading', 'other'],
             required: true
         },
         amount: { type: Number, required: true },
@@ -107,6 +111,7 @@ const tripSchema = new mongoose.Schema({
         balanceForCashPaid: { type: Number, default: 0 }, // Balance after subtracting cashPaid
         balanceForOnlinePaid: { type: Number, default: 0 }, // Balance after subtracting onlinePaid
         balanceForDiscount: { type: Number, default: 0 }, // Balance after subtracting discount
+        narration: { type: String, default: '' },
         timestamp: { type: Date, default: Date.now }
     }],
 
@@ -168,10 +173,10 @@ const tripSchema = new mongoose.Schema({
         tripProfit: { type: Number, default: 0 } // Trip profit: netRent + birdsProfit
     },
 
-    status: { 
-        type: String, 
-        enum: ['started', 'ongoing', 'completed'], 
-        default: 'started' 
+    status: {
+        type: String,
+        enum: ['started', 'ongoing', 'completed'],
+        default: 'started'
     },
 
     // Trip type for transfer tracking
@@ -239,7 +244,7 @@ const tripSchema = new mongoose.Schema({
 });
 
 // Pre-save middleware to generate tripId if not provided
-tripSchema.pre('save', async function(next) {
+tripSchema.pre('save', async function (next) {
     // Generate tripId if not provided (always generate for new trips)
     if (this.isNew && !this.tripId) {
         try {
@@ -251,7 +256,7 @@ tripSchema.pre('save', async function(next) {
             return next(error);
         }
     }
-    
+
     // Ensure tripId is set (fallback if sequence fails)
     if (!this.tripId) {
         const fallbackNumber = String(Date.now()).slice(-6);
@@ -286,7 +291,7 @@ tripSchema.pre('save', async function(next) {
 
     // Calculate average purchase rate for profit calculations (needed for sales, stock, and transfers)
     // Formula: avg rate = total purchase cost / total purchase weight
-    const avgPurchaseRate = this.summary.totalWeightPurchased > 0 ? 
+    const avgPurchaseRate = this.summary.totalWeightPurchased > 0 ?
         this.summary.totalPurchaseAmount / this.summary.totalWeightPurchased : 0;
     this.summary.avgPurchaseRate = Number(avgPurchaseRate.toFixed(2));
 
@@ -295,7 +300,7 @@ tripSchema.pre('save', async function(next) {
         let firstVendorName = '';
         if (this.purchases && this.purchases.length > 0) {
             const firstPurchase = this.purchases[0];
-            
+
             // For transferred trips, check if vendorName is stored in purchase record
             if (this.type === 'transferred' && firstPurchase.vendorName) {
                 firstVendorName = firstPurchase.vendorName;
@@ -322,22 +327,22 @@ tripSchema.pre('save', async function(next) {
         // Process sales sequentially to ensure proper async handling
         for (let i = 0; i < this.sales.length; i++) {
             const sale = this.sales[i];
-            
+
             if (sale.birds && sale.weight) {
                 sale.avgWeight = Number((sale.weight / sale.birds).toFixed(2));
             }
-            
+
             // Set product (vendor name) from first purchase if not already set
             if (!sale.product && firstVendorName) {
                 sale.product = firstVendorName;
             }
-            
+
             // Calculate profit margin and profit amount
             sale.profitMargin = Number((sale.rate - avgPurchaseRate).toFixed(2));
             sale.profitAmount = Number((sale.profitMargin * sale.weight).toFixed(2));
             // Calculate receivedAmount from cashPaid + onlinePaid
             sale.receivedAmount = (sale.cashPaid || 0) + (sale.onlinePaid || 0);
-            
+
             // Calculate Outstanding Balance - preserve sequential balances if already calculated
             // Sequential balances (balanceForSale, balanceForCashPaid, balanceForOnlinePaid, balanceForDiscount)
             // are calculated in the controller for proper sequential accounting
@@ -349,12 +354,12 @@ tripSchema.pre('save', async function(next) {
                         const globalOutstandingBalance = customer.outstandingBalance || 0;
                         const totalPaid = (sale.onlinePaid || 0) + (sale.cashPaid || 0);
                         const discount = sale.discount || 0;
-                        
+
                         // Check if this is a receipt entry (birds = 0, weight = 0, amount typically 0)
-                        const isReceipt = (sale.birds === 0 || !sale.birds) && 
-                                          (sale.weight === 0 || !sale.weight) && 
-                                          (sale.amount === 0 || !sale.amount);
-                        
+                        const isReceipt = (sale.birds === 0 || !sale.birds) &&
+                            (sale.weight === 0 || !sale.weight) &&
+                            (sale.amount === 0 || !sale.amount);
+
                         // If sequential balances are not already set, calculate them
                         // (This happens when data is loaded from DB and saved again)
                         if (sale.balanceForSale === undefined || sale.balanceForSale === null) {
@@ -379,18 +384,18 @@ tripSchema.pre('save', async function(next) {
                                 sale.balanceForDiscount = Number(Math.max(0, balanceForDiscount).toFixed(2));
                             }
                         }
-                        
+
                         // Calculate the final balance after this sale/receipt (use balanceForDiscount if available)
-                        let balance = sale.balanceForDiscount !== undefined && sale.balanceForDiscount !== null 
-                                     ? sale.balanceForDiscount 
-                                     : (globalOutstandingBalance + sale.amount - totalPaid - discount);
-                        
+                        let balance = sale.balanceForDiscount !== undefined && sale.balanceForDiscount !== null
+                            ? sale.balanceForDiscount
+                            : (globalOutstandingBalance + sale.amount - totalPaid - discount);
+
                         // If payment exceeds the sale amount + current outstanding balance, 
                         // the extra payment reduces the balance to 0 (minimum)
                         balance = Math.max(0, balance);
-                        
+
                         sale.balance = balance;
-                        
+
                         // Note: Customer's global outstanding balance will be updated via API call from trip controller
                     }
                 } catch (error) {
@@ -469,7 +474,7 @@ tripSchema.pre('save', async function(next) {
         }
         return sum;
     }, 0);
-    
+
     // Calculate transfer profit margin (rate * weight - purchase cost)
     const totalTransferredProfitMargin = this.transferHistory.reduce((sum, transfer) => {
         const stock = transfer.transferredStock;
@@ -496,19 +501,19 @@ tripSchema.pre('save', async function(next) {
     this.summary.customerSalesAmount = customerSalesAmount;
     this.summary.customerBirdsSold = customerBirdsSold;
     this.summary.customerWeightSold = customerWeightSold;
-    
+
     // TOTAL SALES AMOUNT = Customer Sales + Stock Sales + Transfer Sales (for financial calculations)
     this.summary.totalSalesAmount = customerSalesAmount + totalStockValue + totalTransferredSalesAmount;
-    
+
     // TOTAL BIRDS SOLD = Customer Sales + Stock + Transfers (for inventory tracking)
     this.summary.totalBirdsSold = customerBirdsSold + totalStockBirds + totalTransferredBirds;
-    
+
     // TOTAL WEIGHT SOLD = Customer Sales + Stock + Transfers (for inventory tracking)
     this.summary.totalWeightSold = customerWeightSold + totalStockWeight + totalTransferredWeight;
-    
+
     // TOTAL PROFIT MARGIN = Customer Profit + Stock Profit + Transfer Profit
     this.summary.totalProfitMargin = customerProfitMargin + totalStockProfitMargin + totalTransferredProfitMargin;
-    
+
     // Payment fields (only from customer sales, not stock/transfers)
     this.summary.totalCashPaid = customerCashPaid;
     this.summary.totalOnlinePaid = customerOnlinePaid;
@@ -516,24 +521,24 @@ tripSchema.pre('save', async function(next) {
     this.summary.totalReceivedAmount = customerReceivedAmount;
 
     // Calculate bird weight loss: purchased - sold (includes customer + stock + transfers) - death
-    this.summary.birdWeightLoss = (this.summary.totalWeightPurchased || 0) - 
-                                 (this.summary.totalWeightSold || 0) - 
-                                 (this.summary.totalWeightLost || 0);
+    this.summary.birdWeightLoss = (this.summary.totalWeightPurchased || 0) -
+        (this.summary.totalWeightSold || 0) -
+        (this.summary.totalWeightLost || 0);
 
     // Calculate birds remaining: purchased - sold (includes customer + stock + transfers) - lost
-    this.summary.birdsRemaining = (this.summary.totalBirdsPurchased || 0) - 
-                                 (this.summary.totalBirdsSold || 0) - 
-                                 (this.summary.totalBirdsLost || 0);
+    this.summary.birdsRemaining = (this.summary.totalBirdsPurchased || 0) -
+        (this.summary.totalBirdsSold || 0) -
+        (this.summary.totalBirdsLost || 0);
 
     // Calculate gross rent: rentPerKm * totalDistance
     const totalDistance = this.vehicleReadings?.totalDistance || 0;
     this.summary.grossRent = (this.rentPerKm || 0) * totalDistance;
 
     // Calculate birds profit: Total Sales - Total Purchases - Total Expenses - Gross Rent
-    this.summary.birdsProfit = (this.summary.totalSalesAmount || 0) - 
-                              (this.summary.totalPurchaseAmount || 0) - 
-                              (this.summary.totalExpenses || 0) - 
-                              this.summary.grossRent;
+    this.summary.birdsProfit = (this.summary.totalSalesAmount || 0) -
+        (this.summary.totalPurchaseAmount || 0) -
+        (this.summary.totalExpenses || 0) -
+        this.summary.grossRent;
 
     // Calculate net profit from sales profit margin minus expenses and diesel
     const salesProfit = this.summary.totalProfitMargin || 0;
@@ -546,6 +551,13 @@ tripSchema.pre('save', async function(next) {
 
     // Calculate trip profit: netRent + birdsProfit
     this.summary.tripProfit = Number(((netRent || 0) + (this.summary.birdsProfit || 0)).toFixed(2));
+
+    // Calculate margin: tripProfit / totalWeightPurchased
+    if (this.summary.totalWeightPurchased > 0) {
+        this.summary.profitPerKg = Number((this.summary.tripProfit / this.summary.totalWeightPurchased).toFixed(2));
+    } else {
+        this.summary.profitPerKg = 0;
+    }
 
     // Validate vehicle readings if closing reading is provided
     if (this.vehicleReadings.opening && this.vehicleReadings.closing) {

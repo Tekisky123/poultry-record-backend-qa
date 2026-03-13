@@ -476,6 +476,7 @@ export const getVendorLedger = async (req, res, next) => {
                 supervisor: stock.supervisorId?.name || '-',
                 dcNumber: stock.refNo || '-',
                 birds: stock.birds,
+                bags: stock.bags || 0,
                 weight: stock.weight,
                 avgWeight: stock.avgWeight || (stock.birds > 0 ? stock.weight / stock.birds : 0),
                 rate: stock.rate,
@@ -608,7 +609,9 @@ export const getVendorLedger = async (req, res, next) => {
 
             totalAmount: trips.reduce((sum, t) => sum + (t.purchases.find(p => p.supplier && p.supplier._id.toString() === id)?.amount || 0), 0)
                 + indirectSales.reduce((sum, s) => sum + (s.summary?.totalPurchaseAmount || 0), 0)
-                + inventoryStocks.reduce((sum, s) => sum + (s.amount || 0), 0)
+                + inventoryStocks.reduce((sum, s) => sum + (s.amount || 0), 0),
+
+            totalBags: inventoryStocks.reduce((sum, s) => sum + (s.bags || 0), 0)
         };
 
         // Update Vendor Outstanding Balance (Only if no date filter is applied)

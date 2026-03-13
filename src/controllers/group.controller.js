@@ -6,6 +6,7 @@ import Voucher from "../models/Voucher.js";
 import Trip from "../models/Trip.js";
 import InventoryStock from "../models/InventoryStock.js";
 import IndirectSale from "../models/IndirectSale.js";
+import DieselStation from "../models/DieselStation.js";
 import { successResponse } from "../utils/responseHandler.js";
 import AppError from "../utils/AppError.js";
 import { toSignedValue, fromSignedValue } from "../utils/balanceUtils.js";
@@ -765,6 +766,122 @@ const getAllVendorsInGroup = async (groupId) => {
     return allVendors;
 };
 
+// Calculate diesel station balance
+const calculateDieselStationBalance = (stationDoc, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null) => {
+    try {
+        let periodDebit = 0; // Payments to station
+        let periodCredit = 0; // Purchase from station
+        let periodVolume = 0;
+        let discountAndOther = 0;
+
+        const start = startDate ? new Date(startDate) : null;
+        const end = endDate ? new Date(endDate) : null;
+        if (end) end.setHours(23, 59, 59, 999);
+
+        const stationId = stationDoc._id;
+        const stationName = stationDoc.name;
+
+        // 1. Vouchers (Payments)
+        if (Array.isArray(preFetchedVouchers)) {
+            preFetchedVouchers.forEach(v => {
+                const vDate = new Date(v.date);
+                if (end && vDate > end) return;
+                const isInPeriod = (!start || vDate >= start);
+
+                if (isInPeriod) {
+                    let amount = 0;
+                    let isMatch = false;
+                    let type = 'debit';
+
+                    if (v.voucherType === 'Payment') {
+                        // Check parties
+                        const partyData = v.parties?.find(p => p.partyId && p.partyId.toString() === stationId.toString());
+                        if (partyData) {
+                            amount = partyData.amount || 0;
+                            isMatch = true;
+                            type = 'debit'; // Payment reduces liability
+                        }
+                    } else if (v.voucherType === 'Journal') {
+                        // Journal check entries
+                        const entry = v.entries?.find(e => e.account === stationName); // Assuming account name match for journal
+                        if (entry) {
+                            if (entry.creditAmount > 0) {
+                                amount = entry.creditAmount;
+                                type = 'credit';
+                            } else {
+                                amount = entry.debitAmount;
+                                type = 'debit';
+                            }
+                            isMatch = true;
+                        }
+                    }
+
+                    if (isMatch) {
+                        if (type === 'credit') {
+                            periodCredit += amount;
+                            if (v.voucherType === 'Journal') discountAndOther += amount;
+                        } else {
+                            periodDebit += amount;
+                        }
+                    }
+                }
+            });
+        }
+
+        // 2. Trips (Purchases - Diesel Entries)
+        if (Array.isArray(preFetchedTrips)) {
+            preFetchedTrips.forEach(trip => {
+                const tDate = new Date(trip.createdAt); // Or trip.date? Trip usually has createdAt or date. Using createdAt for consistency with other parts.
+                // Actually trip.date is better if available, but controller mainly uses createdAt for trips in other funcs?
+                // calculateVendorBalance uses createdAt (line 632). 
+
+                if (end && tDate > end) return;
+                const isInPeriod = (!start || tDate >= start);
+
+                if (isInPeriod && trip.diesel && trip.diesel.stations) {
+                    trip.diesel.stations.forEach(station => {
+                        if (station.dieselStation && station.dieselStation.toString() === stationId.toString()) {
+                            periodCredit += station.amount || 0;
+                            periodVolume += station.volume || 0;
+                        }
+                    });
+                }
+            });
+        }
+
+        const finalSigned = toSignedValue(stationDoc.outstandingBalance || 0, stationDoc.outstandingBalanceType || 'credit');
+        // Opening = Closing - (Credit - Debit) 
+        const calculatedOpening = finalSigned - (periodCredit - periodDebit);
+
+        return {
+            debitTotal: periodDebit,
+            creditTotal: periodCredit,
+            finalBalance: finalSigned,
+            openingBalance: calculatedOpening,
+            discountAndOther,
+            volume: periodVolume
+        };
+    } catch (error) {
+        console.error('Error calculating diesel station balance:', error);
+        return { debitTotal: 0, creditTotal: 0, finalBalance: 0, openingBalance: 0 };
+    }
+};
+
+// Recursive function to get all diesel stations in a group
+const getAllDieselStationsInGroup = async (groupId) => {
+    const directStations = await DieselStation.find({ group: groupId, isActive: true }).lean();
+    const subGroups = await Group.find({ parentGroup: groupId, isActive: true }).lean();
+
+    let allStations = [...directStations];
+
+    for (const subGroup of subGroups) {
+        const subGroupStations = await getAllDieselStationsInGroup(subGroup._id);
+        allStations = [...allStations, ...subGroupStations];
+    }
+
+    return allStations;
+};
+
 // Calculate group debit/credit from all ledgers, customers, and vendors
 // OPTIMIZED: Uses pre-fetched data
 const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, endDate = null, preFetchedVouchers = null, preFetchedTrips = null, preFetchedStocks = null, preFetchedIndirectSales = null) => {
@@ -905,6 +1022,43 @@ const calculateGroupDebitCredit = async (groupId, groupType, startDate = null, e
                 totalDebit += Math.abs(finalSigned);
             } else {
                 totalCredit += Math.abs(finalSigned);
+            }
+        }
+    }
+
+    // Calculate from diesel stations
+    const allStations = await getAllDieselStationsInGroup(groupId);
+    for (const station of allStations) {
+        const stationBalance = await calculateDieselStationBalance(
+            station,
+            startDate,
+            endDate,
+            preFetchedVouchers,
+            preFetchedTrips
+        );
+
+        const finalSigned = stationBalance.finalBalance;
+        totalTransactionDebit += stationBalance.debitTotal || 0;
+        totalTransactionCredit += stationBalance.creditTotal || 0;
+        totalDiscountAndOther += stationBalance.discountAndOther || 0;
+
+        if (groupType === 'Assets' || groupType === 'Expenses') {
+            if (finalSigned >= 0) {
+                totalDebit += Math.abs(finalSigned);
+            } else {
+                totalCredit += Math.abs(finalSigned);
+            }
+        } else if (groupType === 'Liability' || groupType === 'Income') {
+            if (finalSigned >= 0) {
+                totalCredit += Math.abs(finalSigned);
+            } else {
+                totalDebit += Math.abs(finalSigned);
+            }
+        } else {
+            if (finalSigned >= 0) {
+                totalCredit += Math.abs(finalSigned);
+            } else {
+                totalDebit += Math.abs(finalSigned);
             }
         }
     }
@@ -1182,14 +1336,66 @@ export const getGroupSummary = async (req, res, next) => {
             });
         }
 
+        // Add diesel stations
+        const directStations = await DieselStation.find({ group: id, isActive: true }).sort({ name: 1 }).lean();
+        for (const station of directStations) {
+            const stationBalance = await calculateDieselStationBalance(
+                station,
+                finalStartDate,
+                finalEndDate,
+                vouchers,
+                trips
+            );
+
+            const finalSigned = stationBalance.finalBalance;
+            let debit = 0;
+            let credit = 0;
+
+            if (group.type === 'Assets' || group.type === 'Expenses') {
+                if (finalSigned >= 0) {
+                    debit = Math.abs(finalSigned);
+                } else {
+                    credit = Math.abs(finalSigned);
+                }
+            } else if (group.type === 'Liability' || group.type === 'Income') {
+                if (finalSigned >= 0) {
+                    credit = Math.abs(finalSigned);
+                } else {
+                    debit = Math.abs(finalSigned);
+                }
+            } else {
+                if (finalSigned >= 0) {
+                    credit = Math.abs(finalSigned); // Stations usually credit balance (Vendor-like)
+                } else {
+                    debit = Math.abs(finalSigned);
+                }
+            }
+
+            entries.push({
+                type: 'dieselStation',
+                id: station._id.toString(),
+                name: station.name,
+                debit,
+                credit,
+                birds: 0,
+                weight: 0,
+                volume: stationBalance.volume || 0,
+                transactionDebit: stationBalance.debitTotal || 0,
+                transactionCredit: stationBalance.creditTotal || 0,
+                discountAndOther: stationBalance.discountAndOther || 0,
+                closingBalance: finalSigned
+            });
+        }
+
         // Calculate totals
         const totals = entries.reduce((acc, entry) => ({
             debit: acc.debit + (entry.debit || 0),
             credit: acc.credit + (entry.credit || 0),
             birds: acc.birds + (entry.birds || 0),
             weight: acc.weight + (entry.weight || 0),
+            volume: acc.volume + (entry.volume || 0),
             discountAndOther: acc.discountAndOther + (entry.discountAndOther || 0)
-        }), { debit: 0, credit: 0, birds: 0, weight: 0, discountAndOther: 0 });
+        }), { debit: 0, credit: 0, birds: 0, weight: 0, volume: 0, discountAndOther: 0 });
 
         successResponse(res, "Group summary retrieved", 200, {
             group: {
