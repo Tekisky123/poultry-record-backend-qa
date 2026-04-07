@@ -1,0 +1,133 @@
+import mongoose from 'mongoose';
+import Trip from '../models/Trip.js';
+
+export const getTripExpensesMonthlySummary = async (req, res) => {
+    try {
+        const { year } = req.query;
+        if (!year) {
+            return res.status(400).json({ success: false, message: 'Year is required' });
+        }
+
+        const numericYear = parseInt(year);
+        // Financial year: April 1st of `year` to March 31st of `year + 1`
+        const startDate = new Date(`${numericYear}-04-01T00:00:00.000Z`);
+        const endDate = new Date(`${numericYear + 1}-03-31T23:59:59.999Z`);
+
+        // Fetch trips in the given date range that have expenses
+        const trips = await Trip.find({
+            date: { $gte: startDate, $lte: endDate },
+            'expenses.0': { $exists: true }
+        }).sort({ date: 1 });
+
+        const monthNames = ["April", "May", "June", "July", "August", "September", "October", "November", "December", "January", "February", "March"];
+        const monthlyData = {};
+
+        monthNames.forEach(name => {
+            monthlyData[name] = { name, amount: 0, dateObj: null };
+        });
+
+        // Map month indexes (0-11 for Jan-Dec) to financial year sorted months
+        const monthOffsets = {
+            3: "April", 4: "May", 5: "June", 6: "July",
+            7: "August", 8: "September", 9: "October", 10: "November", 11: "December",
+            0: "January", 1: "February", 2: "March"
+        };
+        
+        // Give each valid financial month a startDate for navigation
+        Object.keys(monthOffsets).forEach(monthIdx => {
+            const mIdx = parseInt(monthIdx);
+            const y = mIdx >= 3 ? numericYear : numericYear + 1;
+            monthlyData[monthOffsets[mIdx]].dateObj = new Date(y, mIdx, 1);
+        });
+
+        let totalAmount = 0;
+
+        trips.forEach(trip => {
+            const docDate = new Date(trip.date);
+            const monthIdx = docDate.getMonth();
+            const monthName = monthOffsets[monthIdx];
+
+            if (monthName && monthlyData[monthName]) {
+                trip.expenses.forEach(expense => {
+                    const amt = expense.amount || 0;
+                    monthlyData[monthName].amount += amt;
+                    totalAmount += amt;
+                });
+            }
+        });
+
+        const monthsArray = monthNames.map(name => ({
+            name,
+            amount: monthlyData[name].amount,
+            startDate: monthlyData[name].dateObj
+        }));
+
+        res.status(200).json({
+            success: true,
+            data: {
+                months: monthsArray,
+                totals: { amount: totalAmount }
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+export const getTripExpensesDailyRecords = async (req, res) => {
+    try {
+        const { year, month } = req.query;
+        if (!year || !month) {
+            return res.status(400).json({ success: false, message: 'Year and month are required' });
+        }
+
+        const numericYear = parseInt(year);
+        const numericMonth = parseInt(month); // 1 to 12
+
+        const startDate = new Date(numericYear, numericMonth - 1, 1);
+        const lastDay = new Date(numericYear, numericMonth, 0).getDate();
+        const endDate = new Date(numericYear, numericMonth - 1, lastDay, 23, 59, 59, 999);
+
+        const trips = await Trip.find({
+            date: { $gte: startDate, $lte: endDate },
+            'expenses.0': { $exists: true }
+        }).sort({ date: 1 });
+
+        const records = [];
+        let totalAmount = 0;
+
+        trips.forEach(trip => {
+            const dateStr = new Date(trip.date).toISOString().split('T')[0];
+            const tripId = trip.tripId || '-';
+
+            trip.expenses.forEach(expense => {
+                const amount = expense.amount || 0;
+                if (amount !== 0) {
+                    totalAmount += amount;
+                    // Format the category nicely
+                    const formattedCat = expense.category ? expense.category.charAt(0).toUpperCase() + expense.category.slice(1).replace('-', ' ') : 'Other';
+                    
+                    records.push({
+                        date: dateStr,
+                        particular: formattedCat,
+                        tripId: tripId,
+                        amount: amount,
+                        voucherNumber: trip.tripId, // Used internally or for display
+                        narration: expense.description || expense.category || '-',
+                        tripDbId: trip._id
+                    });
+                }
+            });
+        });
+
+        res.status(200).json({
+            success: true,
+            data: {
+                records,
+                totals: { amount: totalAmount }
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};

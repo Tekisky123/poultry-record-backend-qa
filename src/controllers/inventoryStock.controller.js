@@ -507,14 +507,29 @@ export const getStocks = async (req, res, next) => {
                 ...tripQuery,
                 stocks: { $exists: true, $not: { $size: 0 } }
             })
-                .select('tripId stocks supervisor vehicle')
+                .select('tripId stocks supervisor vehicle purchases type')
                 .populate('supervisor', 'name')
                 .populate('vehicle', 'vehicleNumber')
+                .populate('purchases.supplier', 'vendorName name companyName')
                 .lean();
 
             // Flatten trip stocks
-            tripStocks = trips.flatMap(trip =>
-                trip.stocks.map(s => ({
+            tripStocks = trips.flatMap(trip => {
+                let supplierName = '';
+                if (trip.purchases && trip.purchases.length > 0) {
+                    const firstPurchase = trip.purchases[0];
+                    if (trip.type === 'transferred' && firstPurchase.vendorName) {
+                        supplierName = firstPurchase.vendorName;
+                    } else if (firstPurchase.supplier) {
+                        supplierName = firstPurchase.supplier.vendorName || firstPurchase.supplier.companyName || firstPurchase.supplier.name || '';
+                    }
+                }
+                if (!supplierName) {
+                    // Fallback just in case
+                    supplierName = "Trip-Stock (" + (trip.vehicle?.vehicleNumber || 'Unassigned') + ")";
+                }
+
+                return trip.stocks.map(s => ({
                     _id: s._id, // Use stock ID from subdocument
                     source: 'trip', // Marker
                     tripId: trip._id,
@@ -529,10 +544,10 @@ export const getStocks = async (req, res, next) => {
                     date: s.addedAt,
                     supervisorId: trip.supervisor,
                     vehicleId: trip.vehicle,
-                    vendorId: { vendorName: "Trip-Stock (" + (trip.vehicle?.vehicleNumber || 'Unassigned') + ")" }, // Fake vendor
+                    vendorId: { vendorName: supplierName }, // Actual vendor name from purchase
                     notes: s.notes
-                }))
-            );
+                }));
+            });
 
             // Filter flattened trip stocks by params
             if (supervisor) {

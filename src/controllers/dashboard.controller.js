@@ -241,24 +241,10 @@ export const getProfitAndLoss = async (req, res, next) => {
         const { startDate, endDate } = req.query;
 
         // Fetch data
-        const [allLedgers, incomeGroups, expenseGroups, stockGroups] = await Promise.all([
+        const [allLedgers, allGroupsData] = await Promise.all([
             Ledger.find({ isActive: true }).lean(),
-            Group.find({ type: 'Income', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
-            Group.find({ type: 'Expenses', isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 }),
-            Group.find({
-                name: { $in: ['Opening Stock', 'Closing Stock'] },
-                isActive: true
-            }).populate('parentGroup', 'name type slug').lean()
+            Group.find({ isActive: true }).populate('parentGroup', 'name type slug').lean().sort({ name: 1 })
         ]);
-
-        // Route Stock Groups to respective sides (Opening -> Expenses, Closing -> Income)
-        stockGroups.forEach(group => {
-            if (group.name === 'Opening Stock') {
-                expenseGroups.push(group);
-            } else if (group.name === 'Closing Stock') {
-                incomeGroups.push(group);
-            }
-        });
 
         // Build Comprehensive Map
         const periodBalanceMap = await buildPeriodBalanceMap(startDate, endDate, allLedgers);
@@ -275,11 +261,25 @@ export const getProfitAndLoss = async (req, res, next) => {
             }
         });
 
-        // Build Trees
-        const incomeTree = buildTree(incomeGroups);
-        const expenseTree = buildTree(expenseGroups);
+        // Build Full Tree of all active groups
+        const fullTree = buildTree(allGroupsData);
 
-        // Process Groups
+        // Separate groups into respective sides
+        const incomeGroups = fullTree.filter(g => g.type === 'Income');
+        const expenseGroups = fullTree.filter(g => g.type === 'Expenses');
+
+        // Opening Stock -> Expenses, Closing Stock -> Income (including their sub-groups)
+        const openingStock = fullTree.find(g => g.name === 'Opening Stock');
+        if (openingStock && openingStock.type !== 'Expenses') {
+            expenseGroups.push(openingStock);
+        }
+
+        const closingStock = fullTree.find(g => g.name === 'Closing Stock');
+        if (closingStock && closingStock.type !== 'Income') {
+            incomeGroups.push(closingStock);
+        }
+
+        // Process Groups (calculates balances combining child balances)
         const processGroups = async (groups) => {
             const processedGroups = [];
             for (const group of groups) {
@@ -292,7 +292,7 @@ export const getProfitAndLoss = async (req, res, next) => {
                     slug: group.slug,
                     type: group.type,
                     parentGroup: group.parentGroup,
-                    balance: balance.totalBalance, // Positive value means amount present
+                    balance: balance.totalBalance,
                     debitTotal: balance.totalDebit,
                     creditTotal: balance.totalCredit,
                     children: group.children && group.children.length > 0
@@ -305,15 +305,141 @@ export const getProfitAndLoss = async (req, res, next) => {
             return processedGroups;
         };
 
-        const processedIncome = await processGroups(incomeTree);
-        const processedExpenses = await processGroups(expenseTree);
+        const processedIncome = await processGroups(incomeGroups);
+        const processedExpenses = await processGroups(expenseGroups);
 
-        // Calculate Totals - FIX DOUBLE COUNTING
+        const injectNatives = async (incomeList, expenseList, startDate, endDate) => {
+            let sDate = startDate ? new Date(startDate) : new Date(0);
+            let eDate = endDate ? new Date(endDate) : new Date();
+            // ensure eDate goes to end of day
+            eDate.setHours(23, 59, 59, 999);
+
+            const stocks = await InventoryStock.find({ date: { $lte: eDate } }).lean();
+            const trips = await Trip.find({ date: { $lte: eDate } }).lean();
+            const isales = await IndirectSale.find({ date: { $gte: sDate, $lte: eDate } }).lean();
+
+            let metricPurchase = 0;
+            let metricFeedPurchase = 0;
+            let metricSales = 0;
+            let metricMortality = 0;
+            let metricWeightLoss = 0;
+            let metricTripExpenses = 0;
+
+            let c_pWt = 0; let c_pAmt = 0; let c_outWt = 0;
+            let prevDate = new Date(sDate.getTime() - 1);
+            let o_pWt = 0; let o_pAmt = 0; let o_outWt = 0;
+
+            trips.forEach(t => {
+                const tDate = new Date(t.date);
+                const tDateIsPeriod = tDate >= sDate && tDate <= eDate;
+
+                if (tDateIsPeriod) {
+                    metricPurchase += (t.summary?.totalPurchaseAmount || 0);
+                    metricSales += (t.summary?.totalSalesAmount || 0);
+                    if (t.expenses) t.expenses.forEach(e => metricTripExpenses += (e.amount || 0));
+                    if (t.losses) t.losses.forEach(l => {
+                        const lDate = new Date(l.date);
+                        if (lDate >= sDate && lDate <= eDate) metricMortality += (l.total || 0);
+                    });
+                    metricWeightLoss += ((t.summary?.birdWeightLoss || 0) * (t.summary?.avgPurchaseRate || 0));
+                }
+                if (t.stocks && t.stocks.length > 0) {
+                    t.stocks.forEach(st => {
+                        const stDate = new Date(st.addedAt || tDate);
+                        if (stDate <= eDate) { c_pWt += (st.weight || 0); c_pAmt += (st.value || 0); }
+                        if (stDate <= prevDate) { o_pWt += (st.weight || 0); o_pAmt += (st.value || 0); }
+                    });
+                }
+            });
+
+            stocks.forEach(s => {
+                const sDateVal = new Date(s.date);
+                const isPeriod = sDateVal >= sDate && sDateVal <= eDate;
+
+                if (s.inventoryType === 'bird') {
+                    if (s.type === 'purchase' || s.type === 'opening') {
+                        if (sDateVal <= eDate) { c_pWt += (s.weight || 0); c_pAmt += (s.amount || 0); }
+                        if (sDateVal <= prevDate) { o_pWt += (s.weight || 0); o_pAmt += (s.amount || 0); }
+                    } else {
+                        if (sDateVal <= eDate) c_outWt += (s.weight || 0);
+                        if (sDateVal <= prevDate) o_outWt += (s.weight || 0);
+                    }
+                }
+
+                if (isPeriod) {
+                    let amt = s.amount || (s.weight * s.rate) || 0;
+                    if (s.type === 'purchase') {
+                        if (s.inventoryType === 'feed') {
+                            metricFeedPurchase += amt;
+                        } else {
+                            metricPurchase += amt;
+                        }
+                    }
+                    if (s.type === 'sale') metricSales += amt;
+                    if (s.type === 'mortality') metricMortality += amt;
+                    if (s.type === 'weight_loss' || s.type === 'natural_weight_loss') metricWeightLoss += amt;
+                }
+            });
+
+            isales.forEach(s => {
+                metricPurchase += (s.summary?.totalPurchaseAmount || 0);
+                metricSales += (s.summary?.salesAmount || 0);
+                metricMortality += (s.mortality?.amount || 0);
+            });
+
+            const oRate = o_pWt > 0 ? (o_pAmt / o_pWt) : 0;
+            const cRate = c_pWt > 0 ? (c_pAmt / c_pWt) : 0;
+            
+            const metricOpeningStock = Math.max(0, o_pWt - o_outWt) * oRate;
+            const metricClosingStock = Math.max(0, c_pWt - c_outWt) * cRate;
+
+            const updateTrees = (grpList, isOpeningParent = false, isClosingParent = false) => {
+                let diffAccumulator = 0;
+                grpList.forEach(g => {
+                    const name = g.name.trim().toUpperCase();
+                    const inOpening = isOpeningParent || name === 'OPENING STOCK';
+                    const inClosing = isClosingParent || name === 'CLOSING STOCK';
+
+                    let childDiff = 0;
+                    if (g.children && g.children.length > 0) {
+                        childDiff = updateTrees(g.children, inOpening, inClosing);
+                    }
+
+                    let oldBalance = g.balance || 0;
+                    let targetValue = null;
+
+                    if (name.includes('POULTRY FEED PURCHASE')) targetValue = metricFeedPurchase;
+                    else if (name.includes('LIVE POULTRY BIRDS PURCHASE') || name.includes('LIVE POULTRY BIRDS PURCHASES')) targetValue = metricPurchase;
+                    else if (name.includes('LIVE POULTRY BIRDS SALES') || (name.includes('LIVE POULTRY BIRDS') && name.includes('SALES'))) targetValue = metricSales;
+                    else if (name.includes('BIRDS MORTALITY')) targetValue = metricMortality;
+                    else if (name.includes('BIRDS WEIGHT LOSS')) targetValue = metricWeightLoss;
+                    else if (name.includes('TRIP EXPENSES')) targetValue = metricTripExpenses;
+                    else if (name.includes('LIVE POULTRY BIRDS') && inOpening) targetValue = metricOpeningStock;
+                    else if (name.includes('LIVE POULTRY BIRDS') && inClosing) targetValue = metricClosingStock;
+
+                    if (targetValue !== null) {
+                        const localDiff = targetValue - oldBalance;
+                        g.balance = targetValue;
+                        diffAccumulator += localDiff + childDiff;
+                    } else if (childDiff !== 0) {
+                        g.balance += childDiff;
+                        diffAccumulator += childDiff;
+                    }
+                });
+                return diffAccumulator;
+            };
+
+            updateTrees(incomeList);
+            updateTrees(expenseList);
+        };
+
+        await injectNatives(processedIncome, processedExpenses, startDate, endDate);
+
+        // Calculate Totals - using the processed root groups
         const calculateTotal = (groups) => {
             let total = 0;
             groups.forEach(group => {
-                total += group.balance;
-                // Removed recursive call to children, as group.balance already aggregates children
+                total += (group.balance || 0);
             });
             return total;
         };

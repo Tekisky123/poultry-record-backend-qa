@@ -17,7 +17,10 @@ import balanceSheetRouter from './balanceSheet.routes.js';
 import securityRouter from './security.routes.js';
 import settingRouter from './setting.routes.js';
 import inventoryStockRouter from './inventoryStock.routes.js';
-// import sendAddSaleSMS from '../services/sms/sendAddSaleSMS.js';
+import tripExpensesRouter from './tripExpenses.routes.js';
+import birdsMortalityRouter from './birdsMortality.routes.js';
+import birdsWeightLossRouter from './birdsWeightLoss.routes.js';
+import dieselExpensesRouter from './dieselExpenses.routes.js';
 
 router.use('/auth', authRouter);
 router.use('/user', userRouter);
@@ -36,7 +39,10 @@ router.use('/balance-sheet', balanceSheetRouter);
 router.use('/security', securityRouter);
 router.use('/settings', settingRouter);
 router.use('/inventory-stock', inventoryStockRouter);
-// router.get('/test', (req, res) => {
+router.use('/trip-expenses', tripExpensesRouter);
+router.use('/birds-mortality', birdsMortalityRouter);
+router.use('/birds-weight-loss', birdsWeightLossRouter);
+router.use('/diesel-expenses', dieselExpensesRouter);
 //     sendAddSaleSMS("7414969691", {
 //         customerName: "Tauhid Shaikh",
 //         date: "2022-01-01",
