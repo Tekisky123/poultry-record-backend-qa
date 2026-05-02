@@ -380,13 +380,21 @@ export const getMonthlySummary = async (req, res, next) => {
             let voucherAmount = 0;
             let isMatch = false;
 
-            // Entries
-            if (v.entries) {
-                v.entries.forEach(e => {
-                    let entryMatch = false;
-                    const entryAcc = e.account ? e.account.toString().trim().toLowerCase() : '';
-                    if (entryAcc === subjectIdStr || entryAcc === subjectNameStr) entryMatch = true;
+            const isPaymentReceipt = v.voucherType === 'Payment' || v.voucherType === 'Receipt';
 
+            // For Journal/Contra/other vouchers: use entries section only.
+            // For Payment/Receipt vouchers: use parties + account header only.
+            // This prevents double-counting when a Payment/Receipt voucher stores
+            // entries for the cash/bank account AND the account header also references it.
+            if (!isPaymentReceipt && v.entries) {
+                v.entries.forEach(e => {
+                    const entryAcc = e.account ? e.account.toString().trim() : '';
+                    // Match by ID first; fall back to ledger name for legacy data
+                    // where e.account may store the name string instead of the ObjectId
+                    let entryMatch = entryAcc === subjectIdStr;
+                    if (!entryMatch && subjectNameStr && entryAcc.toLowerCase() === subjectNameStr) {
+                        entryMatch = true;
+                    }
                     if (entryMatch) {
                         debit += e.debitAmount || 0;
                         credit += e.creditAmount || 0;
@@ -396,45 +404,48 @@ export const getMonthlySummary = async (req, res, next) => {
                 });
             }
 
-            // Parties
-            if ((v.voucherType === 'Payment' || v.voucherType === 'Receipt') && v.parties) {
-                v.parties.forEach(p => {
-                    if (p.partyId && p.partyId.toString() === subjectIdStr) {
-                        let isTypeMatch = false;
-                        if (subjectType === 'ledger' && p.partyType === 'ledger') isTypeMatch = true;
-                        else if (subjectType === 'customer' && p.partyType === 'customer') isTypeMatch = true;
-                        else if (subjectType === 'vendor' && p.partyType === 'vendor') isTypeMatch = true;
-                        else if (subjectType === 'dieselStation' && (!p.partyType || p.partyType === 'dieselStation')) isTypeMatch = true;
+            if (isPaymentReceipt) {
+                // Parties section
+                if (v.parties) {
+                    v.parties.forEach(p => {
+                        if (p.partyId && p.partyId.toString() === subjectIdStr) {
+                            let isTypeMatch = false;
+                            if (subjectType === 'ledger' && p.partyType === 'ledger') isTypeMatch = true;
+                            else if (subjectType === 'customer' && p.partyType === 'customer') isTypeMatch = true;
+                            else if (subjectType === 'vendor' && p.partyType === 'vendor') isTypeMatch = true;
+                            else if (subjectType === 'dieselStation' && (!p.partyType || p.partyType === 'dieselStation')) isTypeMatch = true;
 
-                        if (isTypeMatch) {
-                            if (v.voucherType === 'Payment') debit += p.amount || 0;
-                            else credit += p.amount || 0;
-                            voucherAmount += p.amount || 0;
-                            isMatch = true;
+                            if (isTypeMatch) {
+                                if (v.voucherType === 'Payment') debit += p.amount || 0;
+                                else credit += p.amount || 0;
+                                voucherAmount += p.amount || 0;
+                                isMatch = true;
+                            }
                         }
-                    }
-                });
-            }
+                    });
+                }
 
-            // Account Header (Ledger)
-            if (subjectType === 'ledger' && (v.voucherType === 'Payment' || v.voucherType === 'Receipt') && v.account) {
-                if (v.account.toString() === subjectIdStr) {
-                    const totalAmount = v.parties ? v.parties.reduce((sum, p) => sum + (p.amount || 0), 0) : 0;
-                    if (v.voucherType === 'Payment') credit += totalAmount;
-                    else debit += totalAmount;
-                    voucherAmount += totalAmount;
-                    isMatch = true;
+                // Account Header (cash/bank ledger that is the payer/receiver)
+                if (subjectType === 'ledger' && v.account) {
+                    if (v.account.toString() === subjectIdStr) {
+                        const totalAmount = v.parties
+                            ? v.parties.reduce((sum, p) => sum + (p.amount || 0), 0)
+                            : 0;
+                        if (v.voucherType === 'Payment') credit += totalAmount;
+                        else debit += totalAmount;
+                        voucherAmount += totalAmount;
+                        isMatch = true;
+                    }
                 }
             }
 
             if (isMatch) {
                 let isDiscount = false;
                 if (subjectType === 'customer') {
-                    if (v.voucherType !== 'Receipt' && v.voucherType !== 'Payment') isDiscount = true;
+                    if (!isPaymentReceipt) isDiscount = true;
                 } else if (subjectType === 'vendor') {
                     if (v.voucherType === 'Receipt' || v.voucherType === 'Journal') isDiscount = true;
                 }
-
                 addToStats(vDate, debit, credit, 0, 0, 0, isDiscount ? voucherAmount : 0, isDiscount);
             }
         }
@@ -693,24 +704,24 @@ export const getDailySummary = async (req, res, next) => {
             let isMatch = false;
 
             const vDate = new Date(v.date);
-            const dayOfMonth = vDate.getDate(); // 1-31
+            const dayOfMonth = vDate.getDate();
             const dayIndex = dayOfMonth - 1;
 
-            if (dayIndex < 0 || dayIndex >= days.length) return; // Should not happen given query
+            if (dayIndex < 0 || dayIndex >= days.length) return;
 
-            // 1. Check entries
-            if (v.entries) {
+            const isPaymentReceipt = v.voucherType === 'Payment' || v.voucherType === 'Receipt';
+
+            // For Journal/Contra/other: use entries only.
+            // For Payment/Receipt: use parties + account header only.
+            // This prevents double-counting the same amount via both paths.
+            if (!isPaymentReceipt && v.entries) {
                 v.entries.forEach(e => {
-                    let entryMatch = false;
-                    const entryAcc = e.account ? e.account.toString().trim().toLowerCase() : '';
-
-                    if (entryAcc === subjectIdStr || entryAcc === subjectNameStr) {
-                        entryMatch = true;
-                    }
+                    const entryAcc = e.account ? e.account.toString().trim() : '';
+                    let entryMatch = entryAcc === subjectIdStr;
+                    // Name fallback for legacy data
                     if (!entryMatch && e.name && e.name.trim().toLowerCase() === subjectNameStr) {
                         entryMatch = true;
                     }
-
                     if (entryMatch) {
                         debit += e.debitAmount || 0;
                         credit += e.creditAmount || 0;
@@ -719,38 +730,36 @@ export const getDailySummary = async (req, res, next) => {
                 });
             }
 
-            // 2. Check Parties (Payment/Receipt)
-            if ((v.voucherType === 'Payment' || v.voucherType === 'Receipt') && v.parties) {
-                v.parties.forEach(p => {
-                    if (p.partyId && p.partyId.toString() === subjectIdStr) {
-                        let isTypeMatch = false;
-                        if (subjectType === 'ledger' && p.partyType === 'ledger') isTypeMatch = true;
-                        else if (subjectType === 'customer' && p.partyType === 'customer') isTypeMatch = true;
-                        else if (subjectType === 'vendor' && p.partyType === 'vendor') isTypeMatch = true;
-                        else if (subjectType === 'dieselStation' && (!p.partyType || p.partyType === 'dieselStation')) isTypeMatch = true;
+            if (isPaymentReceipt) {
+                // Parties
+                if (v.parties) {
+                    v.parties.forEach(p => {
+                        if (p.partyId && p.partyId.toString() === subjectIdStr) {
+                            let isTypeMatch = false;
+                            if (subjectType === 'ledger' && p.partyType === 'ledger') isTypeMatch = true;
+                            else if (subjectType === 'customer' && p.partyType === 'customer') isTypeMatch = true;
+                            else if (subjectType === 'vendor' && p.partyType === 'vendor') isTypeMatch = true;
+                            else if (subjectType === 'dieselStation' && (!p.partyType || p.partyType === 'dieselStation')) isTypeMatch = true;
 
-                        if (isTypeMatch) {
-                            if (v.voucherType === 'Payment') {
-                                debit += p.amount || 0;
-                            } else {
-                                credit += p.amount || 0;
+                            if (isTypeMatch) {
+                                if (v.voucherType === 'Payment') debit += p.amount || 0;
+                                else credit += p.amount || 0;
+                                isMatch = true;
                             }
-                            isMatch = true;
                         }
-                    }
-                });
-            }
+                    });
+                }
 
-            // 3. Check Account Header (For Ledgers - Payment/Receipt)
-            if (subjectType === 'ledger' && (v.voucherType === 'Payment' || v.voucherType === 'Receipt') && v.account) {
-                if (v.account.toString() === subjectIdStr) {
-                    const totalAmount = v.parties ? v.parties.reduce((sum, p) => sum + (p.amount || 0), 0) : 0;
-                    if (v.voucherType === 'Payment') {
-                        credit += totalAmount;
-                    } else {
-                        debit += totalAmount;
+                // Account Header (cash/bank ledger)
+                if (subjectType === 'ledger' && v.account) {
+                    if (v.account.toString() === subjectIdStr) {
+                        const totalAmount = v.parties
+                            ? v.parties.reduce((sum, p) => sum + (p.amount || 0), 0)
+                            : 0;
+                        if (v.voucherType === 'Payment') credit += totalAmount;
+                        else debit += totalAmount;
+                        isMatch = true;
                     }
-                    isMatch = true;
                 }
             }
 

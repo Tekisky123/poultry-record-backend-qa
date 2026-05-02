@@ -272,6 +272,8 @@ const calculateLedgerBalance = (ledgerDoc, startDate = null, endDate = null, pre
     try {
         let periodDebit = 0;
         let periodCredit = 0;
+        let allDebit = 0;
+        let allCredit = 0;
         let voucherAmount = 0;
         const start = startDate ? new Date(startDate) : null;
         const end = endDate ? new Date(endDate) : null;
@@ -324,12 +326,16 @@ const calculateLedgerBalance = (ledgerDoc, startDate = null, endDate = null, pre
                     }
                 }
 
-                if (isInPeriod && isMatch) {
-                    periodDebit += debit;
-                    periodCredit += credit;
-                    // Discount logic (heuristic: Journals are often adjustments/discounts)
-                    if (v.voucherType === 'Journal' || v.voucherType === 'Contra') {
-                        voucherAmount += (debit + credit);
+                if (isMatch) {
+                    allDebit += debit;
+                    allCredit += credit;
+                    if (isInPeriod) {
+                        periodDebit += debit;
+                        periodCredit += credit;
+                        // Discount logic (heuristic: Journals are often adjustments/discounts)
+                        if (v.voucherType === 'Journal' || v.voucherType === 'Contra') {
+                            voucherAmount += (debit + credit);
+                        }
                     }
                 }
             });
@@ -342,7 +348,7 @@ const calculateLedgerBalance = (ledgerDoc, startDate = null, endDate = null, pre
                 if (end && tDate > end) return;
                 const isInPeriod = (!start || tDate >= start);
 
-                if (isInPeriod && t.sales) {
+                if (t.sales) {
                     t.sales.forEach(s => {
                         let localDebit = 0;
                         if (s.cashLedger && s.cashLedger.toString() === ledgerId.toString()) {
@@ -351,7 +357,10 @@ const calculateLedgerBalance = (ledgerDoc, startDate = null, endDate = null, pre
                         if (s.onlineLedger && s.onlineLedger.toString() === ledgerId.toString()) {
                             localDebit += s.onlinePaid || 0;
                         }
-                        if (localDebit > 0) periodDebit += localDebit;
+                        if (localDebit > 0) {
+                            allDebit += localDebit;
+                            if (isInPeriod) periodDebit += localDebit;
+                        }
                     });
                 }
             });
@@ -364,30 +373,31 @@ const calculateLedgerBalance = (ledgerDoc, startDate = null, endDate = null, pre
                 if (end && sDate > end) return;
                 const isInPeriod = (!start || sDate >= start);
 
-                if (isInPeriod) {
-                    let debit = 0;
-                    // Cash Payment
-                    if (s.cashLedgerId && s.cashLedgerId.toString() === ledgerId.toString()) {
-                        debit += s.cashPaid || 0;
-                    }
-                    // Online Payment
-                    if (s.onlineLedgerId && s.onlineLedgerId.toString() === ledgerId.toString()) {
-                        debit += s.onlinePaid || 0;
-                    }
-                    // Expense 
-                    if (s.expenseLedgerId && s.expenseLedgerId.toString() === ledgerId.toString()) {
-                        debit += s.amount || 0;
-                    }
-                    periodDebit += debit;
+                let debit = 0;
+                // Cash Payment
+                if (s.cashLedgerId && s.cashLedgerId.toString() === ledgerId.toString()) {
+                    debit += s.cashPaid || 0;
+                }
+                // Online Payment
+                if (s.onlineLedgerId && s.onlineLedgerId.toString() === ledgerId.toString()) {
+                    debit += s.onlinePaid || 0;
+                }
+                // Expense 
+                if (s.expenseLedgerId && s.expenseLedgerId.toString() === ledgerId.toString()) {
+                    debit += s.amount || 0;
+                }
+                if (debit > 0) {
+                    allDebit += debit;
+                    if (isInPeriod) periodDebit += debit;
                 }
             });
         }
 
-        // Final Balance is trusted from DB
-        const finalSigned = toSignedValue(ledgerDoc.outstandingBalance || 0, ledgerDoc.outstandingBalanceType || 'debit');
+        // Compute finalBalance from opening balance + all transactions up to endDate
+        const openingSigned = toSignedValue(ledgerDoc.openingBalance || 0, ledgerDoc.openingBalanceType || 'debit');
+        const finalSigned = openingSigned + allDebit - allCredit;
 
-        // Calculated Opening = Closing - (Debit - Credit)
-        // This opening balance is derived to make the math work for the period report
+        // Calculated Opening = Closing - period transactions (for period report display)
         const calculatedOpening = finalSigned - (periodDebit - periodCredit);
 
         return {
@@ -412,6 +422,8 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
     try {
         let periodDebit = 0; // Sales count as Debit (Receivable)
         let periodCredit = 0; // Receipts count as Credit
+        let allDebit = 0;
+        let allCredit = 0;
         let birdsTotal = 0;
         let weightTotal = 0;
         let discountAndOther = 0;
@@ -445,7 +457,8 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
                             // We owe them money/refund? Or we gave them money?
                             // If we gave them money (Payment), they owe us more (Debit). 
                             // So Payment -> Debit.
-                            periodDebit += amount;
+                            allDebit += amount;
+                            if (isInPeriod) periodDebit += amount;
                             isMatch = true;
                         }
                     } else if (v.voucherType === 'Receipt') {
@@ -453,7 +466,8 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
                         const partyData = v.parties?.find(p => p.partyId && p.partyId.toString() === customerId.toString());
                         if (partyData) {
                             amount = partyData.amount || 0;
-                            periodCredit += amount;
+                            allCredit += amount;
+                            if (isInPeriod) periodCredit += amount;
                             isMatch = true;
                         }
                     } else {
@@ -461,11 +475,16 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
                         const entry = v.entries?.find(e => e.account === customerName);
                         if (entry) {
                             amount = entry.debitAmount || entry.creditAmount;
-                            if (entry.debitAmount > 0) periodDebit += amount;
-                            else periodCredit += amount;
+                            if (entry.debitAmount > 0) {
+                                allDebit += amount;
+                                if (isInPeriod) periodDebit += amount;
+                            } else {
+                                allCredit += amount;
+                                if (isInPeriod) periodCredit += amount;
+                            }
 
                             // Add to Discount/Other if Journal
-                            discountAndOther += amount;
+                            if (isInPeriod) discountAndOther += amount;
                             isMatch = true;
                         }
                     }
@@ -480,17 +499,24 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
                 if (end && tDate > end) return;
                 const isInPeriod = (!start || tDate >= start);
 
-                if (isInPeriod && trip.sales) {
+                if (trip.sales) {
                     trip.sales.forEach(sale => {
                         if (sale.client && sale.client.toString() === customerId.toString()) {
-                            // Sale Amount -> Debit
-                            periodDebit += sale.amount || 0;
-                            // Payments (Cash/Online) -> Credit
-                            periodCredit += (sale.cashPaid || 0) + (sale.onlinePaid || 0) + (sale.discount || 0);
+                            const saleAmt = sale.amount || 0;
+                            const receiptAmt = (sale.cashPaid || 0) + (sale.onlinePaid || 0) + (sale.discount || 0);
+                            const birds = (sale.birds || sale.birdsCount || 0);
+                            const weight = sale.weight || 0;
 
-                            birdsTotal += (sale.birds || sale.birdsCount || 0);
-                            weightTotal += sale.weight || 0;
-                            discountAndOther += sale.discount || 0;
+                            allDebit += saleAmt;
+                            allCredit += receiptAmt;
+
+                            if (isInPeriod) {
+                                periodDebit += saleAmt;
+                                periodCredit += receiptAmt;
+                                birdsTotal += birds;
+                                weightTotal += weight;
+                                discountAndOther += sale.discount || 0;
+                            }
                         }
                     });
                 }
@@ -504,13 +530,17 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
                 if (end && sDate > end) return;
                 const isInPeriod = (!start || sDate >= start);
 
-                if (isInPeriod && sale.customer && sale.customer.toString() === customerId.toString()) {
+                if (sale.customer && sale.customer.toString() === customerId.toString()) {
                     const salesInfo = sale.sales || {};
-                    // Indirect Sale -> Debit
-                    periodDebit += salesInfo.amount || 0;
+                    const saleAmt = salesInfo.amount || 0;
 
-                    birdsTotal += salesInfo.birds || 0;
-                    weightTotal += salesInfo.weight || 0;
+                    allDebit += saleAmt;
+
+                    if (isInPeriod) {
+                        periodDebit += saleAmt;
+                        birdsTotal += salesInfo.birds || 0;
+                        weightTotal += salesInfo.weight || 0;
+                    }
                 }
             });
         }
@@ -522,22 +552,31 @@ const calculateCustomerBalance = (customerDoc, startDate = null, endDate = null,
                 if (end && sDate > end) return;
                 const isInPeriod = (!start || sDate >= start);
 
-                if (isInPeriod && stock.customerId && stock.customerId.toString() === customerId.toString()) {
+                if (stock.customerId && stock.customerId.toString() === customerId.toString()) {
                     if (stock.type === 'sale' || stock.type === 'receipt') {
-                        if (stock.type === 'sale') {
-                            periodDebit += stock.amount || 0;
-                            birdsTotal += stock.birds || 0;
-                            weightTotal += stock.weight || 0;
+                        const saleAmt = stock.type === 'sale' ? (stock.amount || 0) : 0;
+                        const receiptAmt = (stock.cashPaid || 0) + (stock.onlinePaid || 0) + (stock.discount || 0);
+
+                        allDebit += saleAmt;
+                        allCredit += receiptAmt;
+
+                        if (isInPeriod) {
+                            if (stock.type === 'sale') {
+                                periodDebit += stock.amount || 0;
+                                birdsTotal += stock.birds || 0;
+                                weightTotal += stock.weight || 0;
+                            }
+                            periodCredit += receiptAmt;
+                            discountAndOther += stock.discount || 0;
                         }
-                        // Payments within stock
-                        periodCredit += (stock.cashPaid || 0) + (stock.onlinePaid || 0) + (stock.discount || 0);
-                        discountAndOther += stock.discount || 0;
                     }
                 }
             });
         }
 
-        const finalSigned = toSignedValue(customerDoc.outstandingBalance || 0, customerDoc.outstandingBalanceType || 'debit');
+        // Compute finalBalance from opening balance + all transactions up to endDate
+        const openingSigned = toSignedValue(customerDoc.openingBalance || 0, customerDoc.openingBalanceType || 'debit');
+        const finalSigned = openingSigned + allDebit - allCredit;
         const calculatedOpening = finalSigned - (periodDebit - periodCredit);
 
         return {
@@ -562,6 +601,8 @@ const calculateVendorBalance = (vendorDoc, startDate = null, endDate = null, pre
     try {
         let periodDebit = 0; // Payable Decreases (Payments)
         let periodCredit = 0; // Payable Increases (Purchases)
+        let allDebit = 0;
+        let allCredit = 0;
         let birdsTotal = 0;
         let weightTotal = 0;
         let discountAndOther = 0;
@@ -617,10 +658,14 @@ const calculateVendorBalance = (vendorDoc, startDate = null, endDate = null, pre
 
                     if (amount > 0) {
                         if (type === 'credit') {
-                            periodCredit += amount;
-                            if (v.voucherType === 'Journal' || v.voucherType === 'Receipt') discountAndOther += amount;
+                            allCredit += amount;
+                            if (isInPeriod) {
+                                periodCredit += amount;
+                                if (v.voucherType === 'Journal' || v.voucherType === 'Receipt') discountAndOther += amount;
+                            }
                         } else {
-                            periodDebit += amount;
+                            allDebit += amount;
+                            if (isInPeriod) periodDebit += amount;
                         }
                     }
                 }
@@ -634,25 +679,25 @@ const calculateVendorBalance = (vendorDoc, startDate = null, endDate = null, pre
                 if (end && tDate > end) return;
                 const isInPeriod = (!start || tDate >= start);
 
-                if (isInPeriod) {
-                    trip.purchases.forEach(purchase => {
-                        if (purchase.supplier && purchase.supplier.toString() === vendorId.toString()) {
-                            let purchaseAmount = purchase.amount || 0;
-                            // Check TDS
-                            if (vendorDoc.tdsApplicable && (vendorDoc.tdsUpdatedAt && new Date(trip.date) > new Date(vendorDoc.tdsUpdatedAt))) {
-                                const tds = purchaseAmount * 0.001;
-                                // TDS reduces amount payable to vendor immediately?
-                                // In getVendorLedger: Running Balance += purchase.amount, then -= lessTDS.
-                                // So Purchase Amount is Credit. TDS is Debit.
-                                periodDebit += tds;
-                            }
+                trip.purchases.forEach(purchase => {
+                    if (purchase.supplier && purchase.supplier.toString() === vendorId.toString()) {
+                        let purchaseAmount = purchase.amount || 0;
+                        let tdsAmount = 0;
+                        if (vendorDoc.tdsApplicable && (vendorDoc.tdsUpdatedAt && new Date(trip.date) > new Date(vendorDoc.tdsUpdatedAt))) {
+                            tdsAmount = purchaseAmount * 0.001;
+                        }
 
+                        allCredit += purchaseAmount;
+                        allDebit += tdsAmount;
+
+                        if (isInPeriod) {
+                            if (tdsAmount > 0) periodDebit += tdsAmount;
                             periodCredit += purchaseAmount;
                             birdsTotal += purchase.birds || 0;
                             weightTotal += purchase.weight || 0;
                         }
-                    });
-                }
+                    }
+                });
             });
         }
 
@@ -663,11 +708,15 @@ const calculateVendorBalance = (vendorDoc, startDate = null, endDate = null, pre
                 if (end && sDate > end) return;
                 const isInPeriod = (!start || sDate >= start);
 
-                if (isInPeriod && sale.vendor && sale.vendor.toString() === vendorId.toString()) {
-                    // Vendor sold to us -> We owe them -> Credit
-                    periodCredit += sale.summary?.totalPurchaseAmount || 0;
-                    birdsTotal += sale.summary?.totalPurchaseBirds || 0;
-                    weightTotal += sale.summary?.totalPurchaseWeight || 0;
+                if (sale.vendor && sale.vendor.toString() === vendorId.toString()) {
+                    const purchaseAmt = sale.summary?.totalPurchaseAmount || 0;
+                    allCredit += purchaseAmt;
+
+                    if (isInPeriod) {
+                        periodCredit += purchaseAmt;
+                        birdsTotal += sale.summary?.totalPurchaseBirds || 0;
+                        weightTotal += sale.summary?.totalPurchaseWeight || 0;
+                    }
                 }
             });
         }
@@ -680,26 +729,32 @@ const calculateVendorBalance = (vendorDoc, startDate = null, endDate = null, pre
                 const isInPeriod = (!start || sDate >= start);
 
                 const stockVendorId = stock.vendorId?._id || stock.vendorId;
-                if (isInPeriod && stockVendorId && stockVendorId.toString() === vendorId.toString()) {
-                    if (stock.type === 'purchase' || stock.type === 'opening') { // Typically purchase
+                if (stockVendorId && stockVendorId.toString() === vendorId.toString()) {
+                    if (stock.type === 'purchase' || stock.type === 'opening') {
                         let stockAmount = stock.amount || 0;
+                        let tdsAmount = 0;
                         if (vendorDoc.tdsApplicable && (vendorDoc.tdsUpdatedAt && new Date(stock.date) > new Date(vendorDoc.tdsUpdatedAt))) {
-                            const tds = stockAmount * 0.001;
-                            periodDebit += tds;
+                            tdsAmount = stockAmount * 0.001;
                         }
 
-                        periodCredit += stockAmount;
-                        birdsTotal += stock.birds || 0;
-                        weightTotal += stock.weight || 0;
+                        allCredit += stockAmount;
+                        allDebit += tdsAmount;
+
+                        if (isInPeriod) {
+                            if (tdsAmount > 0) periodDebit += tdsAmount;
+                            periodCredit += stockAmount;
+                            birdsTotal += stock.birds || 0;
+                            weightTotal += stock.weight || 0;
+                        }
                     }
                 }
             });
         }
 
-        const finalSigned = toSignedValue(vendorDoc.outstandingBalance || 0, vendorDoc.outstandingBalanceType || 'credit');
-        // Vendor Opening: Closing - (Credit - Debit)  [Net Increase - Net Decrease]
-        // Since Credit Increases balance for Vendor.
-        const calculatedOpening = finalSigned - (periodCredit - periodDebit);
+        // Compute finalBalance from opening balance + all transactions up to endDate
+        const openingSigned = toSignedValue(vendorDoc.openingBalance || 0, vendorDoc.openingBalanceType || 'credit');
+        const finalSigned = openingSigned + allDebit - allCredit;
+        const calculatedOpening = finalSigned - (periodDebit - periodCredit);
 
         return {
             debitTotal: periodDebit,
@@ -771,6 +826,8 @@ const calculateDieselStationBalance = (stationDoc, startDate = null, endDate = n
     try {
         let periodDebit = 0; // Payments to station
         let periodCredit = 0; // Purchase from station
+        let allDebit = 0;
+        let allCredit = 0;
         let periodVolume = 0;
         let discountAndOther = 0;
 
@@ -818,10 +875,14 @@ const calculateDieselStationBalance = (stationDoc, startDate = null, endDate = n
 
                     if (isMatch) {
                         if (type === 'credit') {
-                            periodCredit += amount;
-                            if (v.voucherType === 'Journal') discountAndOther += amount;
+                            allCredit += amount;
+                            if (isInPeriod) {
+                                periodCredit += amount;
+                                if (v.voucherType === 'Journal') discountAndOther += amount;
+                            }
                         } else {
-                            periodDebit += amount;
+                            allDebit += amount;
+                            if (isInPeriod) periodDebit += amount;
                         }
                     }
                 }
@@ -841,17 +902,28 @@ const calculateDieselStationBalance = (stationDoc, startDate = null, endDate = n
                 if (isInPeriod && trip.diesel && trip.diesel.stations) {
                     trip.diesel.stations.forEach(station => {
                         if (station.dieselStation && station.dieselStation.toString() === stationId.toString()) {
-                            periodCredit += station.amount || 0;
-                            periodVolume += station.volume || 0;
+                            const stationAmt = station.amount || 0;
+                            const stationVol = station.volume || 0;
+                            allCredit += stationAmt;
+                            periodCredit += stationAmt;
+                            periodVolume += stationVol;
+                        }
+                    });
+                } else if (!isInPeriod && trip.diesel && trip.diesel.stations) {
+                    trip.diesel.stations.forEach(station => {
+                        if (station.dieselStation && station.dieselStation.toString() === stationId.toString()) {
+                            allCredit += station.amount || 0;
                         }
                     });
                 }
             });
         }
 
-        const finalSigned = toSignedValue(stationDoc.outstandingBalance || 0, stationDoc.outstandingBalanceType || 'credit');
-        // Opening = Closing - (Credit - Debit) 
-        const calculatedOpening = finalSigned - (periodCredit - periodDebit);
+        // Compute finalBalance from opening balance + all transactions up to endDate
+        const openingSigned = toSignedValue(stationDoc.openingBalance || 0, stationDoc.openingBalanceType || 'credit');
+        const finalSigned = openingSigned + allDebit - allCredit;
+        // Opening = Closing - period transactions
+        const calculatedOpening = finalSigned - (periodDebit - periodCredit);
 
         return {
             debitTotal: periodDebit,

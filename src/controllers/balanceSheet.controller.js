@@ -112,13 +112,24 @@ const buildVoucherBalanceMap = async (asOnDate = null) => {
   }
 };
 
-// Calculate ledger balance (using outstandingBalance)
-const calculateLedgerBalance = (ledger) => {
+// Calculate ledger balance from opening balance + date-filtered voucher entries
+const calculateLedgerBalance = (ledger, voucherBalanceMap) => {
   try {
+    const openingSigned = toSignedValue(ledger.openingBalance || 0, ledger.openingBalanceType || 'debit');
+
+    // Look up voucher entries by ledger name
+    const normalizedName = (ledger.name || '').toString().trim().toLowerCase();
+    const voucherData = voucherBalanceMap ? voucherBalanceMap.get(normalizedName) : null;
+    const debitTotal = voucherData ? voucherData.debitTotal : 0;
+    const creditTotal = voucherData ? voucherData.creditTotal : 0;
+
+    // Balance = opening balance (signed) + debit entries - credit entries
+    const balance = openingSigned + debitTotal - creditTotal;
+
     return {
-      debitTotal: 0, // Not needed for simple balance sheet
-      creditTotal: 0,
-      balance: toSignedValue(ledger.outstandingBalance || 0, ledger.outstandingBalanceType || 'debit')
+      debitTotal,
+      creditTotal,
+      balance
     };
   } catch (error) {
     console.error('Error calculating ledger balance:', error);
@@ -126,17 +137,43 @@ const calculateLedgerBalance = (ledger) => {
   }
 };
 
-// Calculate customer balance (using outstandingBalance)
-const calculateCustomerBalance = (customer) => {
-  return toSignedValue(customer.outstandingBalance || 0, customer.outstandingBalanceType || 'debit');
+// Calculate customer balance from opening balance + date-filtered voucher entries
+const calculateCustomerBalance = (customer, voucherBalanceMap) => {
+  const openingSigned = toSignedValue(customer.openingBalance || 0, customer.openingBalanceType || 'debit');
+
+  // Customers are referenced in vouchers by shopName
+  const normalizedName = (customer.shopName || '').toString().trim().toLowerCase();
+  const voucherData = voucherBalanceMap ? voucherBalanceMap.get(normalizedName) : null;
+  const debitTotal = voucherData ? voucherData.debitTotal : 0;
+  const creditTotal = voucherData ? voucherData.creditTotal : 0;
+
+  return openingSigned + debitTotal - creditTotal;
 };
 
-// Calculate vendor balance (using outstandingBalance)
-const calculateVendorBalance = (vendor) => {
-  return toSignedValue(vendor.outstandingBalance || 0, vendor.outstandingBalanceType || 'credit');
+// Calculate vendor balance from opening balance + date-filtered voucher entries
+const calculateVendorBalance = (vendor, voucherBalanceMap) => {
+  const openingSigned = toSignedValue(vendor.openingBalance || 0, vendor.openingBalanceType || 'credit');
+
+  // Vendors are referenced in vouchers by vendorName
+  const normalizedName = (vendor.vendorName || '').toString().trim().toLowerCase();
+  const voucherData = voucherBalanceMap ? voucherBalanceMap.get(normalizedName) : null;
+  const debitTotal = voucherData ? voucherData.debitTotal : 0;
+  const creditTotal = voucherData ? voucherData.creditTotal : 0;
+
+  return openingSigned + debitTotal - creditTotal;
 };
-const calculateDieselStationBalance = (station) => {
-  return toSignedValue(station.outstandingBalance || 0, station.outstandingBalanceType || 'credit');
+
+// Calculate diesel station balance from opening balance + date-filtered voucher entries
+const calculateDieselStationBalance = (station, voucherBalanceMap) => {
+  const openingSigned = toSignedValue(station.openingBalance || 0, station.openingBalanceType || 'credit');
+
+  // Diesel stations are referenced in vouchers by name
+  const normalizedName = (station.name || '').toString().trim().toLowerCase();
+  const voucherData = voucherBalanceMap ? voucherBalanceMap.get(normalizedName) : null;
+  const debitTotal = voucherData ? voucherData.debitTotal : 0;
+  const creditTotal = voucherData ? voucherData.creditTotal : 0;
+
+  return openingSigned + debitTotal - creditTotal;
 };
 
 const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, vendorGroupMap, customerGroupMap, dieselStationGroupMap, allVouchers, allTrips, allStocks, asOnDate = null) => {
@@ -152,7 +189,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
 
   // Process all ledgers
   for (const ledger of ledgers) {
-    const ledgerBalance = calculateLedgerBalance(ledger);
+    const ledgerBalance = calculateLedgerBalance(ledger, voucherBalanceMap);
     totalDebit += ledgerBalance.debitTotal;
     totalCredit += ledgerBalance.creditTotal;
     totalOpeningBalance += ledger.openingBalance || 0;
@@ -170,7 +207,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
   // Process vendors
   const vendors = vendorGroupMap.get(groupId.toString()) || [];
   for (const vendor of vendors) {
-    const balance = calculateVendorBalance(vendor);
+    const balance = calculateVendorBalance(vendor, voucherBalanceMap);
     // Assuming vendor balance is Debit - Credit (so usually negative for liability)
 
     // Update totals (approximate debit/credit split is hard without full breakdown return, but balance is key)
@@ -197,7 +234,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
   // Process customers
   const customers = customerGroupMap.get(groupId.toString()) || [];
   for (const customer of customers) {
-    const balance = calculateCustomerBalance(customer);
+    const balance = calculateCustomerBalance(customer, voucherBalanceMap);
 
     if (balance >= 0) {
       totalDebit += balance;
@@ -217,7 +254,7 @@ const calculateGroupBalance = async (group, voucherBalanceMap, ledgerGroupMap, v
   // Process diesel stations
   const dieselStations = dieselStationGroupMap.get(groupId.toString()) || [];
   for (const station of dieselStations) {
-    const balance = calculateDieselStationBalance(station);
+    const balance = calculateDieselStationBalance(station, voucherBalanceMap);
     // Diesel Station is typically a Creditor (Liability) -> credit balance is normal.
     // Logic similar to vendors.
     if (balance >= 0) {
@@ -274,13 +311,13 @@ const calculateCapital = async (voucherBalanceMap, allLedgers) => {
       const groupId = ledger.group.toString();
 
       if (incomeGroupIds.has(groupId)) {
-        const balance = calculateLedgerBalance(ledger);
+        const balance = calculateLedgerBalance(ledger, voucherBalanceMap);
         // Income is Credit (Negative in signed value). We want positive magnitude for Total Income.
         // So we subtract the negative balance (or take abs).
         // Safest: -balance.balance (if Credit is -100, Income is 100)
         totalIncome -= balance.balance;
       } else if (expenseGroupIds.has(groupId)) {
-        const balance = calculateLedgerBalance(ledger);
+        const balance = calculateLedgerBalance(ledger, voucherBalanceMap);
         // Expense is Debit (Positive in signed value).
         totalExpenses += balance.balance;
       }
