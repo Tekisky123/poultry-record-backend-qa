@@ -275,15 +275,20 @@ export const updateCustomer = async (req, res, next) => {
 export const deleteCustomer = async (req, res, next) => {
     const { id } = req?.params;
     try {
+        const existingCustomer = await Customer.findById(id);
+        if (!existingCustomer) {
+            return res.status(404).json({ message: "Customer not found" });
+        }
+
+        if (Math.abs(existingCustomer.openingBalance || 0) >= 1 || Math.abs(existingCustomer.outstandingBalance || 0) >= 1) {
+            throw new AppError("Cannot delete customer: It has an opening or outstanding balance.", 400);
+        }
+
         const customer = await Customer.findByIdAndUpdate(
             id,
             { isActive: false, updatedBy: req.user._id },
             { new: true }
         );
-
-        if (!customer) {
-            return res.status(404).json({ message: "Customer not found" });
-        }
 
         successResponse(res, "Customer deleted successfully", 200, customer);
     } catch (error) {
@@ -949,10 +954,17 @@ export const getCustomerPurchaseLedger = async (req, res, next) => {
             });
         });
 
+        const getFYStartDate = (date) => {
+            const d = new Date(date);
+            const year = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+            return new Date(year, 3, 1); // April 1st
+        };
+        const customerFYStartDate = getFYStartDate(customer.createdAt);
+
         // Add OP BAL entry at the beginning (always first entry)
         ledgerEntries.unshift({
             _id: 'opening_balance',
-            date: customer.createdAt, // Use customer creation date
+            date: customerFYStartDate, // Use FY start date of creation
             vehiclesNo: '',
             driverName: '',
             supervisor: '',

@@ -207,6 +207,10 @@ export const deleteLedger = async (req, res, next) => {
             throw new AppError('Ledger not found', 404);
         }
 
+        if (Math.abs(ledger.openingBalance || 0) >= 1 || Math.abs(ledger.outstandingBalance || 0) >= 1) {
+            throw new AppError("Cannot delete ledger: It has an opening or outstanding balance.", 400);
+        }
+
         // Soft delete
         const deletedLedger = await Ledger.findByIdAndUpdate(
             id,
@@ -564,9 +568,20 @@ export const getMonthlySummary = async (req, res, next) => {
         // Calculate Balances natively from Opening fields via Forward Calculation
         // Use standard balance utils which handles this via type
 
+        const getFYStartDate = (date) => {
+            const d = new Date(date);
+            const year = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+            return new Date(year, 3, 1); // April 1st
+        };
+        const subjectFYStartDate = getFYStartDate(subject.createdAt);
+
         // Forward Calculation
         // Use original opening balance + transactions BEFORE start date
-        const origOpenSigned = toSignedValue(subject.openingBalance || 0, subject.openingBalanceType || 'debit');
+        let origOpenSigned = 0;
+        if (startDate >= subjectFYStartDate) {
+            origOpenSigned = toSignedValue(subject.openingBalance || 0, subject.openingBalanceType || 'debit');
+        }
+
         const netBefore = gapBeforeDebit - gapBeforeCredit;
         let yearStartBalanceSigned = origOpenSigned + netBefore;
 

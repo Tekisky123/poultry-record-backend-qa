@@ -163,15 +163,20 @@ export const updateVendor = async (req, res, next) => {
 export const deleteVendor = async (req, res, next) => {
     const { id } = req?.params;
     try {
+        const existingVendor = await Vendor.findById(id);
+        if (!existingVendor) {
+            return res.status(404).json({ message: "Vendor not found" });
+        }
+
+        if (Math.abs(existingVendor.openingBalance || 0) >= 1 || Math.abs(existingVendor.outstandingBalance || 0) >= 1) {
+            throw new AppError("Cannot delete vendor: It has an opening or outstanding balance.", 400);
+        }
+
         const vendor = await Vendor.findByIdAndUpdate(
             id,
             { isActive: false },
             { new: true }
         );
-
-        if (!vendor) {
-            return res.status(404).json({ message: "Vendor not found" });
-        }
 
         successResponse(res, "Vendor deleted successfully", 200, vendor);
     } catch (error) {
@@ -192,6 +197,12 @@ export const getVendorLedger = async (req, res, next) => {
         if (!vendor) {
             throw new AppError('Vendor not found', 404);
         }
+
+        const isTdsApplicableForDate = (date) => {
+            if (!vendor.tdsApplicable) return false;
+            if (!vendor.tdsUpdatedAt) return true;
+            return new Date(date) >= new Date(vendor.tdsUpdatedAt);
+        };
 
         // Build Date Query
         const dateQuery = {};
@@ -267,14 +278,28 @@ export const getVendorLedger = async (req, res, next) => {
             .populate('supervisorId', 'name')
             .lean();
 
+        const getFYStartDate = (date) => {
+            const d = new Date(date);
+            const year = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+            return new Date(year, 3, 1); // April 1st
+        };
+        const vendorFYStartDate = getFYStartDate(vendor.createdAt);
+
         // 3. Calculate Opening Balance for the filtered period
-        let periodOpeningBalance = vendor.openingBalance || 0;
-        if (filterType === 'PURCHASE') {
-            // If filtering for Purchases only, we show 0 opening balance to list only relevant records
-            periodOpeningBalance = 0;
-        } else {
-            if (vendor.openingBalanceType === 'debit') {
-                periodOpeningBalance = -periodOpeningBalance;
+        let periodOpeningBalance = 0;
+        let injectOpBalTransaction = false;
+
+        if (filterType !== 'PURCHASE') {
+            if (!startDate || new Date(startDate) >= vendorFYStartDate) {
+                periodOpeningBalance = vendor.openingBalance || 0;
+                if (vendor.openingBalanceType === 'debit') {
+                    periodOpeningBalance = -periodOpeningBalance;
+                }
+            } else {
+                // Query starts before vendor was created (FY-wise). We must inject OP balance later.
+                if (vendor.openingBalance > 0) {
+                    injectOpBalTransaction = true;
+                }
             }
         }
 
@@ -323,7 +348,7 @@ export const getVendorLedger = async (req, res, next) => {
                     let tripAmount = purchase.amount || 0;
 
                     // Logic to deduct TDS from previous trips calculation if applicable
-                    if (vendor.tdsApplicable && (vendor.tdsUpdatedAt && new Date(trip.date) > new Date(vendor.tdsUpdatedAt))) {
+                    if (isTdsApplicableForDate(trip.date)) {
                         const tdsAmount = tripAmount * 0.001; // 0.1% TDS
                         tripAmount -= tdsAmount;
                     }
@@ -380,7 +405,7 @@ export const getVendorLedger = async (req, res, next) => {
             for (const stock of prevStocks) {
                 let stockAmount = stock.amount || 0;
                 // Add TDS logic if needed here too, assuming consistent 
-                if (vendor.tdsApplicable && (vendor.tdsUpdatedAt && new Date(stock.date) > new Date(vendor.tdsUpdatedAt))) {
+                if (isTdsApplicableForDate(stock.date)) {
                     const tdsAmount = stockAmount * 0.001;
                     stockAmount -= tdsAmount;
                 }
@@ -398,7 +423,7 @@ export const getVendorLedger = async (req, res, next) => {
             purchases.forEach((purchase, index) => {
                 // Calculate TDS for current period trips
                 let lessTDS = 0;
-                if (vendor.tdsApplicable && (vendor.tdsUpdatedAt && new Date(trip.date) > new Date(vendor.tdsUpdatedAt))) {
+                if (isTdsApplicableForDate(trip.date)) {
                     lessTDS = (purchase.amount || 0) * 0.001; // 0.1% TDS
                 }
 
@@ -459,7 +484,7 @@ export const getVendorLedger = async (req, res, next) => {
         // Process Inventory Stocks
         for (const stock of inventoryStocks) {
             let lessTDS = 0;
-            if (vendor.tdsApplicable && (vendor.tdsUpdatedAt && new Date(stock.date) > new Date(vendor.tdsUpdatedAt))) {
+            if (isTdsApplicableForDate(stock.date)) {
                 lessTDS = (stock.amount || 0) * 0.001;
             }
 
@@ -541,6 +566,32 @@ export const getVendorLedger = async (req, res, next) => {
             }
         }
 
+        if (injectOpBalTransaction) {
+            ledgerEntries.push({
+                _id: 'op_bal_injected',
+                uniqueId: 'OP_BAL_INJECTED',
+                date: vendorFYStartDate,
+                type: 'OPENING',
+                particulars: 'ACCOUNT OPENING BALANCE',
+                vehicleNo: '-',
+                driverName: '-',
+                supervisor: '-',
+                dcNumber: '-',
+                birds: 0,
+                bags: 0,
+                weight: 0,
+                avgWeight: 0,
+                rate: 0,
+                amount: vendor.openingBalance,
+                lessTDS: 0,
+                tripId: '-',
+                voucherNo: '-',
+                timestamp: vendorFYStartDate.getTime(),
+                amountType: vendor.openingBalanceType || 'credit',
+                narration: 'System Opening Balance'
+            });
+        }
+
         // 4. Sort by Date ASC
         ledgerEntries.sort((a, b) => a.timestamp - b.timestamp);
 
@@ -578,6 +629,9 @@ export const getVendorLedger = async (req, res, next) => {
                 if (entry.lessTDS) {
                     runningBalance -= entry.lessTDS; // Reduce payable by TDS amount
                 }
+            } else if (entry.uniqueId === 'OP_BAL_INJECTED') {
+                 if (entry.amountType === 'credit') runningBalance += entry.amount;
+                 else runningBalance -= entry.amount;
             } else if (entry.amountType === 'credit') {
                 runningBalance += entry.amount; // Journal Credit increases Payable
             } else if (entry.amountType === 'debit' || entry.type === 'PAYMENT' || entry.type === 'RECEIPT') {

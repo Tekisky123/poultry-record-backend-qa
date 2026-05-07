@@ -1697,6 +1697,10 @@ export const updateTripStatus = async (req, res, next) => {
             throw new AppError('Invalid status. Must be one of: started, ongoing, completed', 400);
         }
 
+        if (status === 'completed' && req.user.role === 'supervisor') {
+            throw new AppError('Only admin or superadmin can mark a trip as completed', 403);
+        }
+
         let query = { _id: id };
         if (req.user.role === 'supervisor') {
             query.supervisor = req.user._id;
